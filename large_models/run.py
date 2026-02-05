@@ -3,7 +3,6 @@ import os
 
 import random
 
-import wandb
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
@@ -143,6 +142,8 @@ class OurArguments(TrainingArguments):
     save_on_interrupt: bool = False  # save model when interrupted (useful for long training)
 
     clean_model_at_end: bool = True  # remove everthing at the end.
+    # Disable external reporters (e.g., wandb) by default to avoid import-time failures.
+    report_to: str = "none"
 
 def parse_args():
     parser = argparse.ArgumentParser()
