@@ -92,6 +92,14 @@ class OurArguments(TrainingArguments):
 
     update_interval: int = 2000
     gauss_rank: int = 8
+    # ZO-AdamU (AdaMU)
+    zo_adamu_T1: int = None
+    zo_adamu_T2: int = None
+    zo_adamu_T3: int = None
+    zo_adamu_alpha_target: float = 0.5
+    zo_adamu_beta1_target: float = 0.9
+    zo_adamu_beta2_target: float = 0.01
+    zo_adamu_sigma: float = 1e-8
 
     
     # Prefix tuning
