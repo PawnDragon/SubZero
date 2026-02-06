@@ -42,6 +42,7 @@ from transformers import Trainer
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
 from transformers.dependency_versions_check import dep_version_check
+from muon import SingleDeviceMuonWithAuxAdam as muon
 
 # Integrations must be imported before ML frameworks:
 from transformers.integrations import (  # isort: split
@@ -355,6 +356,62 @@ class OurTrainer(Trainer):
             assert args.lr_scheduler_type == "constant", (
                 "we did not implement lr_schedule."
             )
+        elif args.trainer == "zo_muon":
+            # High-dim params (ndim>=2) -> Muon; all others -> AuxAdam
+            muon_params, adam_params = [], []
+            for n, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if p.ndim >= 2:
+                    muon_params.append(p)
+                else:
+                    adam_params.append(p)
+
+            # defaults (override via args if exists)
+            muon_lr = float(getattr(args, "muon_lr", args.learning_rate))
+            muon_momentum = float(getattr(args, "muon_momentum", 0.95))
+            muon_wd = float(
+                getattr(
+                    args, "muon_weight_decay", getattr(args, "weight_decay", 0.0) or 0.0
+                )
+            )
+
+            adam_lr = float(getattr(args, "adam_lr", args.learning_rate))
+            adam_betas = tuple(getattr(args, "adam_betas", (0.9, 0.95)))
+            adam_eps = float(getattr(args, "adam_eps", 1e-10))
+            adam_wd = float(
+                getattr(
+                    args, "adam_weight_decay", getattr(args, "weight_decay", 0.0) or 0.0
+                )
+            )
+
+            param_groups = []
+            if len(adam_params) > 0:
+                param_groups.append(
+                    dict(
+                        params=adam_params,
+                        lr=adam_lr,
+                        betas=adam_betas,
+                        eps=adam_eps,
+                        weight_decay=adam_wd,
+                        use_muon=False,
+                    )
+                )
+            if len(muon_params) > 0:
+                param_groups.append(
+                    dict(
+                        params=muon_params,
+                        lr=muon_lr,
+                        momentum=muon_momentum,
+                        weight_decay=muon_wd,
+                        use_muon=True,
+                    )
+                )
+
+            self.optimizer = muon(param_groups)
+            assert args.lr_scheduler_type == "constant", (
+                "we did not implement lr_schedule."
+            )
         elif args.trainer == "zo_adamu":
             # ZO-AdamU uses custom in-place update; keep a dummy optimizer for callbacks/checkpointing.
             self.optimizer = SGD(self.model.parameters(), lr=0.0)
@@ -586,6 +643,11 @@ class OurTrainer(Trainer):
                         tr_loss_step = self.zo_step(model, inputs)
                     else:
                         raise ValueError(f"q={args.q} is not supported.")
+                elif args.trainer == "zo_muon":
+                    if args.q == 1:
+                        tr_loss_step = self.zo_muon_step(model, inputs)
+                    else:
+                        raise ValueError(f"q={args.q} is not supported.")
                 elif args.trainer == "zo_adamu":
                     if args.q == 1:
                         tr_loss_step = self.zo_adamu_step(model, inputs)
@@ -638,6 +700,8 @@ class OurTrainer(Trainer):
                     # MeZO added: update model with the estimated gradient
                     if args.trainer in ["zo_sgd", "zo_adam"]:
                         self.zo_update(model)
+                    elif args.trainer == "zo_muon":
+                        self.zo_muon_update(model)
                     elif args.trainer == "zo_adamu":
                         self.zo_adamu_update(model)
                     elif args.trainer == "subzero_sgd":
@@ -992,6 +1056,71 @@ class OurTrainer(Trainer):
                 param.data.mul_(1.0 - lr * wd)
 
             param.data.addcdiv_(m, denom, value=-lr * g)
+
+        self.update_steps += 1
+        if self.update_steps % 1000 == 0:
+            print("model update:", self.update_steps)
+        self.lr_scheduler.step()
+
+    ########################
+    # ZO-Muon placeholders #
+    ########################
+
+    @torch.no_grad()
+    def zo_muon_step(self, model, inputs):
+        args = self.args
+
+        # collect trainable params
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
+                param.grad = None
+
+        # seed for this step
+        self.zo_random_seed = np.random.randint(1000000000)
+
+        # f(theta + eps*z)
+        self.zo_perturb_parameters(scaling_factor=1)
+        loss1 = self.zo_forward(model, inputs)
+
+        assert args.q == 1
+        if self.args.perturbation_mode == "one_side":
+            self.zo_perturb_parameters(scaling_factor=-1)
+            loss2 = self.zo_forward(model, inputs)
+            self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
+        else:
+            self.zo_perturb_parameters(scaling_factor=-2)
+            loss2 = self.zo_forward(model, inputs)
+            self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+            self.zo_perturb_parameters(scaling_factor=1)
+
+        assert self.args.gradient_accumulation_steps == 1
+        return loss1
+
+    @torch.no_grad()
+    def zo_muon_update(self, model):
+        # resample same z
+        torch.manual_seed(self.zo_random_seed)
+        g = float(self.projected_grad)
+
+        # set pseudo grads
+        for name, param in self.named_parameters_to_optim:
+            z = torch.normal(
+                mean=0,
+                std=1,
+                size=param.data.size(),
+                device=param.data.device,
+                dtype=param.data.dtype,
+            )
+            param.grad = z.mul(g)
+
+        # single optimizer step (Muon+AuxAdam)
+        self.optimizer.step()
+
+        # clear grads
+        for _, param in self.named_parameters_to_optim:
+            param.grad = None
 
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
