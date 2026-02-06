@@ -59,3 +59,4 @@ wandb==0.16.1
 wheel==0.42.0
 xxhash==3.4.1
 yarl==1.9.4
+tensorboard
