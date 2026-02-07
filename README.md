@@ -31,9 +31,11 @@ Please read `run.py` for a complete list of arguments. We introduce some of the 
 * `--num_test`: Number of testing examples.
 * `--model_name`: HuggingFace model name or path.
 * `--task_name`: Task name.
-* `--trainer`: can be `none` (zero-shot/ICL), `regular` (fine-tuning), or `zo_sgd` (MeZO) or `subzero_sgd`(SubZero).
+* `--trainer`: can be `none` (zero-shot/ICL), `regular` (fine-tuning), `zo_sgd` (MeZO), `zo_adamu` (AdaMU), `subzero_sgd` (SubZero), or `subzero_adamu` (SubZO-AdaMU).
 * `--train_as_classification`: turn this on for classification tasks (Cross Entropy over likelihood of each class' label words). Otherwise it is LM-style teacher forcing.
 * `--zo_eps`: ZO hyperparameter epsilon
+* `--gauss_rank`, `--update_interval`: SubZero subspace rank and refresh interval (used by `subzero_sgd` and `subzero_adamu`).
+* `--zo_adamu_*`: AdaMU schedule/hyperparameters (`zo_adamu_T1/T2/T3`, `zo_adamu_alpha_target`, `zo_adamu_beta1_target`, `zo_adamu_beta2_target`, `zo_adamu_sigma`).
 * `--prefix_tuning`: use prefix-tuning. 
 * `--lora`: use LoRA.
 * `--prompt_tuning`: use prompt-tuning.

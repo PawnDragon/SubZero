@@ -71,6 +71,9 @@ class OurArguments(TrainingArguments):
     ## - zo_sgd: zeroth-order SGD (MeZO) training
     ## - zo_conserv: zeroth-order SGD conservative training
     ## - zo_adam: zeroth-order Adam training
+    ## - zo_adamu: zeroth-order AdaMU training
+    ## - subzero_sgd: SubZero training
+    ## - subzero_adamu: SubZO-AdaMU training
     ## - zo_sign_opt: zeroth-order sign sgd training
     ## - forward_grad: forward gradient
     ## (add) -zo_sgd_svd 
