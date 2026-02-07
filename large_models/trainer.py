@@ -43,6 +43,7 @@ from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
 from transformers.dependency_versions_check import dep_version_check
 from muon import SingleDeviceMuonWithAuxAdam as muon
+from muon import zeropower_via_newtonschulz5
 
 # Integrations must be imported before ML frameworks:
 from transformers.integrations import (  # isort: split
@@ -664,6 +665,11 @@ class OurTrainer(Trainer):
                         tr_loss_step = self.subzero_adamu_step(model, inputs)
                     else:
                         raise ValueError(f"q={args.q} is not supported.")
+                elif args.trainer in ["subzero_muon", "subzo_muon"]:
+                    if args.q == 1:
+                        tr_loss_step = self.subzero_muon_step(model, inputs)
+                    else:
+                        raise ValueError(f"q={args.q} is not supported.")
                 elif args.trainer in ["subzero_sgd"]:
                     if args.q == 1:
                         tr_loss_step = self.zo_subspace_step(model, inputs)
@@ -717,6 +723,8 @@ class OurTrainer(Trainer):
                         self.zo_adamu_update(model)
                     elif args.trainer in ["subzero_adamu", "subzo_adamu"]:
                         self.subzero_adamu_update(model)
+                    elif args.trainer in ["subzero_muon", "subzo_muon"]:
+                        self.subzero_muon_update(model)
                     elif args.trainer == "subzero_sgd":
                         self.zo_subspace_update(model)
                     elif args.trainer == "forward_grad":
@@ -1093,7 +1101,9 @@ class OurTrainer(Trainer):
                 z = (U @ dir0 @ V * scale).view(param.data.shape)
                 param.data.add_(z, alpha=float(scaling_factor) * self.args.zo_eps)
             else:
-                param.data.add_(st["m_step"], alpha=float(scaling_factor) * self.args.zo_eps)
+                param.data.add_(
+                    st["m_step"], alpha=float(scaling_factor) * self.args.zo_eps
+                )
 
     @torch.no_grad()
     def _subzo_cache_dirs(self):
@@ -1105,6 +1115,8 @@ class OurTrainer(Trainer):
         beta1 = float(getattr(self, "_subzo_beta1", 0.9))
         std1 = math.sqrt(alpha) if alpha > 0.0 else 0.0
         std2 = math.sqrt(1.0 - alpha) if alpha < 1.0 else 0.0
+
+        ns_steps = int(getattr(self.args, "subzo_muon_ns_steps", 5))
 
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
@@ -1151,6 +1163,14 @@ class OurTrainer(Trainer):
             z_dot = n1 * std1
             z_ddot = st["m"] + n2 * std2
             st["m_step"] = beta1 * z_dot + (1.0 - beta1) * z_ddot
+
+            if self.args.trainer in ["subzero_muon", "subzo_muon"]:
+                if st["m_step"].ndim == 2:
+                    O = zeropower_via_newtonschulz5(st["m_step"], steps=ns_steps)
+                    O = O * math.sqrt(max(1.0, O.size(-2) / O.size(-1)))
+                    st["O_step"] = O.to(dtype=st["m_step"].dtype)
+                else:
+                    st["O_step"] = st["m_step"]
 
     @torch.no_grad()
     def subzero_adamu_step(self, model, inputs):
@@ -1213,7 +1233,14 @@ class OurTrainer(Trainer):
                 st = self.p_state.setdefault(name, {})
                 # strict Eq.(4) uses st["m"] as the mean; initialized inside _subzo_cache_dirs
                 self.named_parameters_to_optim.append(
-                    (name, param, False, None, None, len(self.named_parameters_to_optim))
+                    (
+                        name,
+                        param,
+                        False,
+                        None,
+                        None,
+                        len(self.named_parameters_to_optim),
+                    )
                 )
 
             param.grad = None
@@ -1233,9 +1260,13 @@ class OurTrainer(Trainer):
         self._subzo_cache_dirs()
 
         # First function evaluation: f(theta + eps*m)
-        debug_check = self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
+        debug_check = (
+            self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
+        )
         if debug_check:
-            dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = self.named_parameters_to_optim[0]
+            dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = (
+                self.named_parameters_to_optim[0]
+            )
             dbg_base = dbg_param.data.clone()
 
         self.subzero_adamu_perturb_parameters(scaling_factor=1.0)
@@ -1299,6 +1330,177 @@ class OurTrainer(Trainer):
 
             st["m"] = st["m_step"].detach().clone()
             st.pop("m_step", None)
+
+        self.update_steps += 1
+        if self.update_steps % 1000 == 0:
+            print("model update:", self.update_steps)
+        self.lr_scheduler.step()
+
+    ##############################
+    # SubZO-Muon (SubZero + Muon)
+    ##############################
+
+    @torch.no_grad()
+    def subzero_muon_perturb_parameters(self, scaling_factor: float):
+        """
+        theta += scaling_factor * eps * O_step
+        O_step is sampled once per step and must stay fixed for both +/- perturbations and the update.
+        """
+        for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
+            st = self.p_state[name]
+            if is_subspace:
+                dir0 = st["O_step"]
+                scale = math.sqrt(param.data.numel() / dir0.numel())
+                z = (U @ dir0 @ V * scale).view(param.data.shape)
+                param.data.add_(z, alpha=float(scaling_factor) * self.args.zo_eps)
+            else:
+                param.data.add_(
+                    st["O_step"], alpha=float(scaling_factor) * self.args.zo_eps
+                )
+
+    @torch.no_grad()
+    def subzero_muon_step(self, model, inputs):
+        """
+        Two-side SPSA using O_step (Muon NS-orthogonalized direction for 2D).
+        Returns loss at theta + eps*O_step.
+        """
+        args = self.args
+
+        # What parameters to optimize
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            is_subspace = len(torch.squeeze(param.data).shape) == 2
+            if is_subspace:
+                st = self.p_state.setdefault(name, {})
+                if args.mode in ["lora", "prefix", "prompt"]:
+                    w_shape = reshape_matrix(param.data.numel())
+                else:
+                    w_shape = param.data.shape
+
+                if "U" not in st:
+                    st["U"] = torch.zeros(
+                        w_shape[0],
+                        args.gauss_rank,
+                        device=param.device,
+                        dtype=param.data.dtype,
+                    )
+                    st["V"] = torch.zeros(
+                        args.gauss_rank,
+                        w_shape[1],
+                        device=param.device,
+                        dtype=param.data.dtype,
+                    )
+
+                if self.state.global_step % args.update_interval == 0:
+                    U_new, V_new = fast_svd_method_v2(
+                        w_shape=w_shape,
+                        device=param.device,
+                        dtype=param.data.dtype,
+                        rank=args.gauss_rank,
+                    )
+                    st["U"] = U_new
+                    st["V"] = V_new
+
+                U = st["U"]
+                V = st["V"]
+                self.named_parameters_to_optim.append(
+                    (name, param, True, U, V, len(self.named_parameters_to_optim))
+                )
+            else:
+                self.p_state.setdefault(name, {})
+                self.named_parameters_to_optim.append(
+                    (
+                        name,
+                        param,
+                        False,
+                        None,
+                        None,
+                        len(self.named_parameters_to_optim),
+                    )
+                )
+
+            param.grad = None
+
+        # Sample the random seed for this step
+        self.zo_random_seed = int(np.random.randint(1000000000))
+
+        # Prepare momentum-biased directions for this step (low-dim for subspace params)
+        t = int(self.state.global_step)
+        alpha, beta1, _ = self.zo_adamu_anneal(t)
+        alpha = float(min(1.0, max(0.0, alpha)))
+        self._subzo_alpha = alpha
+        self._subzo_beta1 = beta1
+
+        # Cache per-parameter directions for this step (m_step and O_step)
+        self._subzo_cache_dirs()
+
+        # First function evaluation: f(theta + eps*O_step)
+        debug_check = (
+            self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
+        )
+        if debug_check:
+            dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = (
+                self.named_parameters_to_optim[0]
+            )
+            dbg_base = dbg_param.data.clone()
+
+        self.subzero_muon_perturb_parameters(scaling_factor=1.0)
+        if debug_check:
+            dbg_delta_pos = (dbg_param.data - dbg_base).detach()
+        loss1 = self.zo_forward(model, inputs)
+
+        assert args.q == 1, "only support q=1 for now."
+        if self.args.perturbation_mode == "one_side":
+            self.subzero_muon_perturb_parameters(scaling_factor=-1.0)
+            loss2 = self.zo_forward(model, inputs)
+            self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
+        else:
+            self.subzero_muon_perturb_parameters(scaling_factor=-2.0)
+            if debug_check:
+                dbg_delta_neg = (dbg_param.data - dbg_base).detach()
+                max_abs = (dbg_delta_pos + dbg_delta_neg).abs().max().item()
+                print(f"SubZO-Muon two-side dir check max_abs={max_abs:.3e}")
+            loss2 = self.zo_forward(model, inputs)
+            self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+            self.subzero_muon_perturb_parameters(scaling_factor=1.0)
+
+        assert self.args.gradient_accumulation_steps == 1
+        return loss1
+
+    @torch.no_grad()
+    def subzero_muon_update(self, model):
+        """
+        theta <- theta - lr * projected_grad * O_step
+        Carry st["m"] <- st["m_step"] for next step, then clear per-step caches.
+        """
+        lr = float(self._get_learning_rate())
+        g = float(self.projected_grad)
+        wd = float(getattr(self.args, "weight_decay", 0.0) or 0.0)
+
+        for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
+            st = self.p_state[name]
+
+            if wd > 0.0 and (
+                "bias" not in name
+                and "layer_norm" not in name
+                and "layernorm" not in name
+            ):
+                param.data.mul_(1.0 - lr * wd)
+
+            if is_subspace:
+                dir0 = st["O_step"]
+                scale = math.sqrt(param.data.numel() / dir0.numel())
+                update_full = (U @ dir0 @ V * scale).view(param.data.shape)
+                param.data.add_(update_full, alpha=-lr * g)
+            else:
+                param.data.add_(st["O_step"], alpha=-lr * g)
+
+            st["m"] = st["m_step"].detach().clone()
+            st.pop("m_step", None)
+            st.pop("O_step", None)
 
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
