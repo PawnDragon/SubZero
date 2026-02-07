@@ -1289,11 +1289,7 @@ class OurTrainer(Trainer):
 
             if is_subspace:
                 m_low = st["m_low"]
-                v_low = st["v_low"]
-                denom = v_low.sqrt().add_(sigma)
-                update_low = m_low / denom
-                scale = math.sqrt(param.data.numel() / m_low.numel())
-                update_full = (U @ update_low @ V * scale).view(param.data.shape)
+                update_full = (U @ m_low @ V).view(param.data.shape)
                 param.data.add_(update_full, alpha=-lr * g)
             else:
                 m = st["m"]
