@@ -1082,24 +1082,81 @@ class OurTrainer(Trainer):
     @torch.no_grad()
     def subzero_adamu_perturb_parameters(self, scaling_factor: float):
         """
-        theta += scaling_factor * eps * m (subspace for 2D params, full for others)
+        theta += scaling_factor * eps * m_step
+        Strict paper(4): m_step is sampled once per step and must stay fixed for both +/- perturbations and the update.
         """
-        for name, param, is_subspace, U, V in self.named_parameters_to_optim:
+        for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
             if is_subspace:
-                m_low = st["m_low"]
-                scale = math.sqrt(param.data.numel() / m_low.numel())
-                z = (U @ m_low @ V * scale).view(param.data.shape)
+                dir0 = st["m_step"]
+                scale = math.sqrt(param.data.numel() / dir0.numel())
+                z = (U @ dir0 @ V * scale).view(param.data.shape)
                 param.data.add_(z, alpha=float(scaling_factor) * self.args.zo_eps)
             else:
-                m = st["m"]
-                param.data.add_(m, alpha=float(scaling_factor) * self.args.zo_eps)
+                param.data.add_(st["m_step"], alpha=float(scaling_factor) * self.args.zo_eps)
+
+    @torch.no_grad()
+    def _subzo_cache_dirs(self):
+        """
+        Sample m_{t+1} once per step according to paper Eq.(4), cache as st["m_step"].
+        Use st["m"] as the persistent mean (previous step's m_t). Do NOT modify m_step later this step.
+        """
+        alpha = float(getattr(self, "_subzo_alpha", 0.5))
+        beta1 = float(getattr(self, "_subzo_beta1", 0.9))
+        std1 = math.sqrt(alpha) if alpha > 0.0 else 0.0
+        std2 = math.sqrt(1.0 - alpha) if alpha < 1.0 else 0.0
+
+        for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
+            st = self.p_state[name]
+            if "m" not in st:
+                if is_subspace:
+                    st["m"] = torch.zeros(
+                        (self.args.gauss_rank, self.args.gauss_rank),
+                        device=param.device,
+                        dtype=param.data.dtype,
+                    )
+                else:
+                    st["m"] = torch.zeros_like(param.data)
+
+            g = torch.Generator(device=param.device)
+            g.manual_seed(int(self.zo_random_seed + 10007 * idx))
+
+            if is_subspace:
+                n1 = torch.randn(
+                    (self.args.gauss_rank, self.args.gauss_rank),
+                    device=param.device,
+                    dtype=param.data.dtype,
+                    generator=g,
+                )
+                n2 = torch.randn(
+                    (self.args.gauss_rank, self.args.gauss_rank),
+                    device=param.device,
+                    dtype=param.data.dtype,
+                    generator=g,
+                )
+            else:
+                n1 = torch.randn(
+                    param.data.size(),
+                    device=param.device,
+                    dtype=param.data.dtype,
+                    generator=g,
+                )
+                n2 = torch.randn(
+                    param.data.size(),
+                    device=param.device,
+                    dtype=param.data.dtype,
+                    generator=g,
+                )
+
+            z_dot = n1 * std1
+            z_ddot = st["m"] + n2 * std2
+            st["m_step"] = beta1 * z_dot + (1.0 - beta1) * z_ddot
 
     @torch.no_grad()
     def subzero_adamu_step(self, model, inputs):
         """
-        Two-side SPSA using AdaMU perturbation direction m.
-        For 2D params, m is in low-rank subspace (r x r).
+        Two-side SPSA using momentum-biased perturbation direction.
+        For 2D params, direction is in low-rank subspace (r x r).
         Returns loss at theta + eps*m (same behavior as zo_step).
         """
         args = self.args
@@ -1131,13 +1188,6 @@ class OurTrainer(Trainer):
                         device=param.device,
                         dtype=param.data.dtype,
                     )
-                    st["m_low"] = torch.zeros(
-                        args.gauss_rank,
-                        args.gauss_rank,
-                        device=param.device,
-                        dtype=param.data.dtype,
-                    )
-                    st["v_low"] = torch.zeros_like(st["m_low"])
 
                 # update subspace and project momentum if needed
                 if self.state.global_step % args.update_interval == 0:
@@ -1148,101 +1198,49 @@ class OurTrainer(Trainer):
                         rank=args.gauss_rank,
                     )
 
-                    U_old = st.get("U", None)
-                    V_old = st.get("V", None)
-                    if (
-                        U_old is not None
-                        and V_old is not None
-                        and U_old.shape[0] == U_new.shape[0]
-                        and V_old.shape[1] == V_new.shape[1]
-                    ):
-                        # project low-dim momentum to new subspace
-                        proj_left = U_new.T @ U_old
-                        proj_right = V_old @ V_new.T
-                        st["m_low"] = proj_left @ st["m_low"] @ proj_right
-                        st["v_low"] = proj_left @ st["v_low"] @ proj_right
-                    else:
-                        # shape mismatch: reset low-dim states to avoid invalid projection
-                        st["m_low"].zero_()
-                        st["v_low"].zero_()
+                    # NOTE: strict Eq.(4) uses st["m"] (r x r) as the persistent mean.
+                    # Since st["m"] already lives in r x r for subspace params, no projection is needed here.
 
                     st["U"] = U_new
                     st["V"] = V_new
 
                 U = st["U"]
                 V = st["V"]
-                self.named_parameters_to_optim.append((name, param, True, U, V))
+                self.named_parameters_to_optim.append(
+                    (name, param, True, U, V, len(self.named_parameters_to_optim))
+                )
             else:
                 st = self.p_state.setdefault(name, {})
-                if "m" not in st:
-                    st["m"] = torch.zeros_like(param.data)
-                    st["v"] = torch.zeros_like(param.data)
-                self.named_parameters_to_optim.append((name, param, False, None, None))
+                # strict Eq.(4) uses st["m"] as the mean; initialized inside _subzo_cache_dirs
+                self.named_parameters_to_optim.append(
+                    (name, param, False, None, None, len(self.named_parameters_to_optim))
+                )
 
             param.grad = None
 
         # Sample the random seed for this step
         self.zo_random_seed = int(np.random.randint(1000000000))
 
-        # Prepare m,v for this step (low-dim for subspace params)
+        # Prepare momentum-biased directions for this step (low-dim for subspace params)
         t = int(self.state.global_step)
-        alpha, beta1, beta2 = self.zo_adamu_anneal(t)
+        alpha, beta1, _ = self.zo_adamu_anneal(t)
         alpha = float(min(1.0, max(0.0, alpha)))
-        one_minus_alpha = 1.0 - alpha
-        std1 = math.sqrt(alpha) if alpha > 0.0 else 0.0
-        std2 = math.sqrt(one_minus_alpha) if one_minus_alpha > 0.0 else 0.0
+        # cache for perturb/update
+        self._subzo_alpha = alpha
+        self._subzo_beta1 = beta1
 
-        for idx, (name, param, is_subspace, _, _) in enumerate(self.named_parameters_to_optim):
-            st = self.p_state[name]
-            g = torch.Generator(device=param.device)
-            g.manual_seed(int(self.zo_random_seed + 10007 * idx))
-
-            if is_subspace:
-                n1 = torch.randn(
-                    (args.gauss_rank, args.gauss_rank),
-                    device=param.device,
-                    dtype=param.data.dtype,
-                    generator=g,
-                )
-                n2 = torch.randn(
-                    (args.gauss_rank, args.gauss_rank),
-                    device=param.device,
-                    dtype=param.data.dtype,
-                    generator=g,
-                )
-                z_dot = n1 * std1
-                z_ddot = st["m_low"] + n2 * std2
-                st["m_low"] = beta1 * z_dot + (1.0 - beta1) * z_ddot
-                st["v_low"] = beta2 * (z_dot * z_dot) + (1.0 - beta2) * (
-                    z_ddot * z_ddot
-                )
-            else:
-                n1 = torch.randn(
-                    param.data.size(),
-                    device=param.device,
-                    dtype=param.data.dtype,
-                    generator=g,
-                )
-                n2 = torch.randn(
-                    param.data.size(),
-                    device=param.device,
-                    dtype=param.data.dtype,
-                    generator=g,
-                )
-                z_dot = n1 * std1
-                z_ddot = st["m"] + n2 * std2
-                st["m"] = beta1 * z_dot + (1.0 - beta1) * z_ddot
-                st["v"] = beta2 * (z_dot * z_dot) + (1.0 - beta2) * (z_ddot * z_ddot)
-
-        # optional debug cache
-        self._zo_adamu_alpha, self._zo_adamu_beta1, self._zo_adamu_beta2 = (
-            alpha,
-            beta1,
-            beta2,
-        )
+        # Cache per-parameter directions for this step
+        self._subzo_cache_dirs()
 
         # First function evaluation: f(theta + eps*m)
+        debug_check = self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
+        if debug_check:
+            dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = self.named_parameters_to_optim[0]
+            dbg_base = dbg_param.data.clone()
+
         self.subzero_adamu_perturb_parameters(scaling_factor=1.0)
+        if debug_check:
+            dbg_delta_pos = (dbg_param.data - dbg_base).detach()
         loss1 = self.zo_forward(model, inputs)
 
         assert args.q == 1, "only support q=1 for now."
@@ -1254,6 +1252,10 @@ class OurTrainer(Trainer):
         else:
             # theta+eps*m -> theta-eps*m
             self.subzero_adamu_perturb_parameters(scaling_factor=-2.0)
+            if debug_check:
+                dbg_delta_neg = (dbg_param.data - dbg_base).detach()
+                max_abs = (dbg_delta_pos + dbg_delta_neg).abs().max().item()
+                print(f"SubZO-AdaMU two-side dir check max_abs={max_abs:.3e}")
             loss2 = self.zo_forward(model, inputs)
             self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
 
@@ -1267,16 +1269,16 @@ class OurTrainer(Trainer):
     @torch.no_grad()
     def subzero_adamu_update(self, model):
         """
-        In-place SubZO-AdaMU update:
-          theta -= lr * projected_grad * m / (sqrt(v) + sigma)
-        For 2D params, m/v are r x r and mapped via U, V with norm alignment.
+        Strict Eq.(5) style update:
+          theta <- theta - lr * ghat * m_step
+        where ghat = projected_grad, m_step is the SAME direction used for both +/- perturbations.
+        After update, set st["m"] <- st["m_step"] for next iteration (Eq.(4) recursion).
         """
         lr = float(self._get_learning_rate())
-        sigma = float(getattr(self.args, "zo_adamu_sigma", 1e-8))
         g = float(self.projected_grad)
         wd = float(getattr(self.args, "weight_decay", 0.0) or 0.0)
 
-        for name, param, is_subspace, U, V in self.named_parameters_to_optim:
+        for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
 
             # Optional decoupled weight decay
@@ -1288,14 +1290,15 @@ class OurTrainer(Trainer):
                 param.data.mul_(1.0 - lr * wd)
 
             if is_subspace:
-                m_low = st["m_low"]
-                update_full = (U @ m_low @ V).view(param.data.shape)
+                dir0 = st["m_step"]
+                scale = math.sqrt(param.data.numel() / dir0.numel())
+                update_full = (U @ dir0 @ V * scale).view(param.data.shape)
                 param.data.add_(update_full, alpha=-lr * g)
             else:
-                m = st["m"]
-                v = st["v"]
-                denom = v.sqrt().add_(sigma)
-                param.data.addcdiv_(m, denom, value=-lr * g)
+                param.data.add_(st["m_step"], alpha=-lr * g)
+
+            st["m"] = st["m_step"].detach().clone()
+            st.pop("m_step", None)
 
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
