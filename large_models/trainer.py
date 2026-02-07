@@ -1113,50 +1113,58 @@ class OurTrainer(Trainer):
             is_subspace = len(torch.squeeze(param.data).shape) == 2
             if is_subspace:
                 st = self.p_state.setdefault(name, {})
+                if args.mode in ["lora", "prefix", "prompt"]:
+                    w_shape = reshape_matrix(param.data.numel())
+                else:
+                    w_shape = param.data.shape
+
                 if "U" not in st:
                     st["U"] = torch.zeros(
-                        param.data.size(0),
+                        w_shape[0],
                         args.gauss_rank,
                         device=param.device,
                         dtype=param.data.dtype,
                     )
                     st["V"] = torch.zeros(
                         args.gauss_rank,
-                        param.data.size(1),
+                        w_shape[1],
                         device=param.device,
                         dtype=param.data.dtype,
                     )
                     st["m_low"] = torch.zeros(
-                        args.gauss_rank, args.gauss_rank, device=param.device, dtype=param.data.dtype
+                        args.gauss_rank,
+                        args.gauss_rank,
+                        device=param.device,
+                        dtype=param.data.dtype,
                     )
                     st["v_low"] = torch.zeros_like(st["m_low"])
 
                 # update subspace and project momentum if needed
                 if self.state.global_step % args.update_interval == 0:
-                    if args.mode in ["lora", "prefix", "prompt"]:
-                        w_shape = reshape_matrix(param.data.numel())
-                        U_new, V_new = fast_svd_method_v2(
-                            w_shape=w_shape,
-                            device=param.device,
-                            dtype=param.data.dtype,
-                            rank=args.gauss_rank,
-                        )
-                    else:
-                        U_new, V_new = fast_svd_method_v2(
-                            w_shape=param.data.shape,
-                            device=param.device,
-                            dtype=param.data.dtype,
-                            rank=args.gauss_rank,
-                        )
+                    U_new, V_new = fast_svd_method_v2(
+                        w_shape=w_shape,
+                        device=param.device,
+                        dtype=param.data.dtype,
+                        rank=args.gauss_rank,
+                    )
 
                     U_old = st.get("U", None)
                     V_old = st.get("V", None)
-                    if U_old is not None and V_old is not None:
+                    if (
+                        U_old is not None
+                        and V_old is not None
+                        and U_old.shape[0] == U_new.shape[0]
+                        and V_old.shape[1] == V_new.shape[1]
+                    ):
                         # project low-dim momentum to new subspace
                         proj_left = U_new.T @ U_old
                         proj_right = V_old @ V_new.T
                         st["m_low"] = proj_left @ st["m_low"] @ proj_right
                         st["v_low"] = proj_left @ st["v_low"] @ proj_right
+                    else:
+                        # shape mismatch: reset low-dim states to avoid invalid projection
+                        st["m_low"].zero_()
+                        st["v_low"].zero_()
 
                     st["U"] = U_new
                     st["V"] = V_new
