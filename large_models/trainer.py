@@ -420,8 +420,18 @@ class OurTrainer(Trainer):
                 "we did not implement lr_schedule."
             )
         elif args.trainer in ["subzero_adamu", "subzo_adamu"]:
-            # SubZO-AdaMU uses custom in-place update; keep a dummy optimizer for callbacks/checkpointing.
-            self.optimizer = SGD(self.model.parameters(), lr=0.0)
+            # SubZO-AdaMU uses manual gradient injection; keep a simple SGD optimizer.
+            self.optimizer = SGD(
+                self.model.parameters(), lr=args.learning_rate, momentum=0.0
+            )
+            assert args.lr_scheduler_type == "constant", (
+                "we did not implement lr_schedule."
+            )
+        elif args.trainer in ["subzero_muon", "subzo_muon"]:
+            # SubZO-Muon uses manual gradient injection; keep a simple SGD optimizer.
+            self.optimizer = SGD(
+                self.model.parameters(), lr=args.learning_rate, momentum=0.0
+            )
             assert args.lr_scheduler_type == "constant", (
                 "we did not implement lr_schedule."
             )
@@ -916,8 +926,8 @@ class OurTrainer(Trainer):
         Falls back to defaults if args don't define the fields.
         """
         max_steps = int(getattr(self.args, "max_steps", 0) or 0)
-        default_T1 = int(max_steps * 0.1) if max_steps > 0 else 1000
-        default_T2 = int(max_steps * 0.4) if max_steps > 0 else 5000
+        default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
+        default_T2 = int(max_steps * 0.5) if max_steps > 0 else 5000
         default_T3 = int(max_steps) if max_steps > 0 else 10**9
 
         T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
@@ -1120,7 +1130,7 @@ class OurTrainer(Trainer):
 
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
-            if "m" not in st:
+            if "m" not in st and not (not is_subspace and self.args.trainer in ["subzero_adamu", "subzo_adamu"]):
                 if is_subspace:
                     st["m"] = torch.zeros(
                         (self.args.gauss_rank, self.args.gauss_rank),
@@ -1160,9 +1170,12 @@ class OurTrainer(Trainer):
                     generator=g,
                 )
 
-            z_dot = n1 * std1
-            z_ddot = st["m"] + n2 * std2
-            st["m_step"] = beta1 * z_dot + (1.0 - beta1) * z_ddot
+            if not is_subspace and self.args.trainer in ["subzero_adamu", "subzo_adamu"]:
+                st["m_step"] = n1
+            else:
+                z_dot = n1 * std1
+                z_ddot = st["m"] + n2 * std2
+                st["m_step"] = beta1 * z_dot + (1.0 - beta1) * z_ddot
 
             if self.args.trainer in ["subzero_muon", "subzo_muon"]:
                 if st["m_step"].ndim == 2:
@@ -1325,12 +1338,16 @@ class OurTrainer(Trainer):
             if is_subspace:
                 dir0 = st["m_step"]
                 scale = math.sqrt(param.data.numel() / dir0.numel())
-                update_full = (U @ dir0 @ V * scale).view(param.data.shape)
-                param.data.add_(update_full, alpha=-lr * g)
+                z = (U @ dir0 @ V * scale).view(param.data.shape)
             else:
-                param.data.add_(st["m_step"], alpha=-lr * g)
+                z = st["m_step"]
 
-            st["m"] = st["m_step"].detach().clone()
+            param.grad = g * z
+            self.optimizer.step()
+            param.grad = None
+
+            if is_subspace or self.args.trainer not in ["subzero_adamu", "subzo_adamu"]:
+                st["m"] = st["m_step"].detach().clone()
             st.pop("m_step", None)
 
         self.update_steps += 1
@@ -1501,10 +1518,13 @@ class OurTrainer(Trainer):
             if is_subspace:
                 dir0 = st["O_step"]
                 scale = math.sqrt(param.data.numel() / dir0.numel())
-                update_full = (U @ dir0 @ V * scale).view(param.data.shape)
-                param.data.add_(update_full, alpha=-lr * g)
+                z = (U @ dir0 @ V * scale).view(param.data.shape)
             else:
-                param.data.add_(st["O_step"], alpha=-lr * g)
+                z = st["O_step"]
+
+            param.grad = g * z
+            self.optimizer.step()
+            param.grad = None
 
             st["m"] = st["m_step"].detach().clone()
             st.pop("m_step", None)
