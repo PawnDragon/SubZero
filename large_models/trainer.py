@@ -1211,16 +1211,18 @@ class OurTrainer(Trainer):
 
                 # update subspace and project momentum if needed
                 if self.state.global_step % args.update_interval == 0:
+                    U_old = st["U"]
+                    V_old = st["V"]
                     U_new, V_new = fast_svd_method_v2(
                         w_shape=w_shape,
                         device=param.device,
                         dtype=param.data.dtype,
                         rank=args.gauss_rank,
                     )
-
-                    # NOTE: strict Eq.(4) uses st["m"] (r x r) as the persistent mean.
-                    # Since st["m"] already lives in r x r for subspace params, no projection is needed here.
-
+                    if "m" in st:
+                        proj_left = U_new.T @ U_old
+                        proj_right = V_old @ V_new.T
+                        st["m"] = proj_left @ st["m"] @ proj_right
                     st["U"] = U_new
                     st["V"] = V_new
 
@@ -1395,12 +1397,18 @@ class OurTrainer(Trainer):
                     )
 
                 if self.state.global_step % args.update_interval == 0:
+                    U_old = st["U"]
+                    V_old = st["V"]
                     U_new, V_new = fast_svd_method_v2(
                         w_shape=w_shape,
                         device=param.device,
                         dtype=param.data.dtype,
                         rank=args.gauss_rank,
                     )
+                    if "m" in st:
+                        proj_left = U_new.T @ U_old
+                        proj_right = V_old @ V_new.T
+                        st["m"] = proj_left @ st["m"] @ proj_right
                     st["U"] = U_new
                     st["V"] = V_new
 
