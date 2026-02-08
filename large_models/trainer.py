@@ -422,7 +422,9 @@ class OurTrainer(Trainer):
         elif args.trainer in ["subzero_adamu", "subzo_adamu"]:
             # SubZO-AdaMU uses manual gradient injection; keep a simple SGD optimizer.
             self.optimizer = SGD(
-                self.model.parameters(), lr=args.learning_rate, momentum=0.0
+                self.model.parameters(),
+                lr=args.learning_rate,
+                momentum=args.momentum,
             )
             assert args.lr_scheduler_type == "constant", (
                 "we did not implement lr_schedule."
@@ -927,7 +929,7 @@ class OurTrainer(Trainer):
         """
         max_steps = int(getattr(self.args, "max_steps", 0) or 0)
         default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
-        default_T2 = int(max_steps * 0.5) if max_steps > 0 else 5000
+        default_T2 = int(max_steps * 0.4) if max_steps > 0 else 5000
         default_T3 = int(max_steps) if max_steps > 0 else 10**9
 
         T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
@@ -1130,7 +1132,10 @@ class OurTrainer(Trainer):
 
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
-            if "m" not in st and not (not is_subspace and self.args.trainer in ["subzero_adamu", "subzo_adamu"]):
+            if "m" not in st and not (
+                not is_subspace
+                and self.args.trainer in ["subzero_adamu", "subzo_adamu"]
+            ):
                 if is_subspace:
                     st["m"] = torch.zeros(
                         (self.args.gauss_rank, self.args.gauss_rank),
@@ -1170,7 +1175,10 @@ class OurTrainer(Trainer):
                     generator=g,
                 )
 
-            if not is_subspace and self.args.trainer in ["subzero_adamu", "subzo_adamu"]:
+            if not is_subspace and self.args.trainer in [
+                "subzero_adamu",
+                "subzo_adamu",
+            ]:
                 st["m_step"] = n1
             else:
                 z_dot = n1 * std1
@@ -1193,6 +1201,12 @@ class OurTrainer(Trainer):
         Returns loss at theta + eps*m (same behavior as zo_step).
         """
         args = self.args
+        t = int(self.state.global_step)
+        max_steps = int(getattr(self.args, "max_steps", 0) or 0)
+        default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
+        T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
+        if t < T1:
+            return self.zo_subspace_step(model, inputs)
 
         # What parameters to optimize
         self.named_parameters_to_optim = []
@@ -1264,7 +1278,6 @@ class OurTrainer(Trainer):
         self.zo_random_seed = int(np.random.randint(1000000000))
 
         # Prepare momentum-biased directions for this step (low-dim for subspace params)
-        t = int(self.state.global_step)
         alpha, beta1, _ = self.zo_adamu_anneal(t)
         alpha = float(min(1.0, max(0.0, alpha)))
         # cache for perturb/update
@@ -1320,6 +1333,14 @@ class OurTrainer(Trainer):
         where ghat = projected_grad, m_step is the SAME direction used for both +/- perturbations.
         After update, set st["m"] <- st["m_step"] for next iteration (Eq.(4) recursion).
         """
+        t = int(self.state.global_step)
+        max_steps = int(getattr(self.args, "max_steps", 0) or 0)
+        default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
+        T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
+        if t < T1:
+            self.zo_subspace_update(model)
+            return
+
         lr = float(self._get_learning_rate())
         g = float(self.projected_grad)
         wd = float(getattr(self.args, "weight_decay", 0.0) or 0.0)
