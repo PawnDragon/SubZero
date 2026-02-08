@@ -57,6 +57,10 @@ We provide an example of the OPT-1.3b model performing prompt tuning on the SST-
 ### FO-SGD
 `CUDA_VISIBLE_DEVICES=0 python run.py --task_name=SST2 --model_name=facebook/opt-1.3b --output_dir=result/opt1.3b-SST2-prompt-sgd --num_train_epochs=5 --per_device_train_batch_size=16 --load_best_model_at_end --evaluation_strategy=steps --save_strategy=steps --save_total_limit=1 --eval_steps=1000 --max_steps=20000 --logging_steps=10 --num_eval=1000 --num_train=1000 --num_dev=500 --train_as_classification --perturbation_mode=two_side --trainer=sgd --optimizer=sgd --train_set_seed=0 --lr_scheduler_type=constant --eval_steps=500 --save_steps=500 --prompt_tuning --num_virtual_tokens=10 --prompt_init_by_real_tokens --learning_rate=1e-3 --zo_eps=1e-2 --weight_decay=0`
 
+## read tfevent
+
+`python -u read_tfevents.py "large_models/result/SST2/opt-1.3b/prompt/subzo_adamu/subzo_adamu-SST2-0-opt-1.3b-OPTIM_prompt-STEP20000-adamw-momen0.0-LR0.001-constant-ZOEPS0.01-T2000-gauss_rank8-Q1-bs16-gradAccumulation1/2026-02-07_22-23-28/events.out.tfevents.1770474209.autodl-container-e999448ba2-4300a65f.3553.0" --scalars accuracy/val accuracy/test train_loss --summary max`
+
 ## Acknowledgment
 
 This project is built upon the foundation laid by [MeZO: Fine-Tuning Language Models with Just Forward Passes](https://github.com/princeton-nlp/MeZO) and [Revisiting Zeroth-Order Optimization for Memory-Efficient LLM Fine-Tuning: A Benchmark](https://github.com/ZO-Bench/ZO-LLM/tree/main). The original code from their project is licensed under the [MIT License](https://github.com/princeton-nlp/MeZO/blob/main/LICENSE) and [License](https://github.com/ZO-Bench/ZO-LLM/blob/main/LICENSE) respectively. We would like to thank the authors for their great work and contributions.
