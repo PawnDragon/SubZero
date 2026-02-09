@@ -924,12 +924,17 @@ class OurTrainer(Trainer):
 
     def zo_adamu_anneal(self, t: int):
         """
-        Piecewise + cosine anneal.
-        Falls back to defaults if args don't define the fields.
+        Match paper's piecewise + cosine anneal in Fig/Eq(7), with phi depending on (alpha, beta1, beta2).
+
+        We compute Anneal_phi(t) per Eq(7), which lies in [0.9, 1] after warmup,
+        then map it to:
+          alpha:  1   -> alpha_target
+          beta1:  1   -> beta1_target
+          beta2:  0   -> beta2_target
         """
         max_steps = int(getattr(self.args, "max_steps", 0) or 0)
         default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
-        default_T2 = int(max_steps * 0.4) if max_steps > 0 else 5000
+        default_T2 = int(max_steps * 0.6) if max_steps > 0 else 5000
         default_T3 = int(max_steps) if max_steps > 0 else 10**9
 
         T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
@@ -940,19 +945,45 @@ class OurTrainer(Trainer):
         beta1_target = float(getattr(self.args, "zo_adamu_beta1_target", 0.9))
         beta2_target = float(getattr(self.args, "zo_adamu_beta2_target", 0.01))
 
-        if t < T1:
-            return 1.0, 0.0, 0.0
+        # phi in the paper
+        phi_alpha = float(getattr(self.args, "zo_adamu_phi_alpha", 1.0))
+        phi_beta1 = float(getattr(self.args, "zo_adamu_phi_beta1", 0.1))
+        phi_beta2 = float(getattr(self.args, "zo_adamu_phi_beta2", 1.5))
 
-        if t < T2:
-            u = (t - T1) / max(1, (T2 - T1))
-            c = 0.5 * (1.0 + math.cos(math.pi * u))  # 1 -> 0
-            alpha = alpha_target + (1.0 - alpha_target) * c
-            beta1 = beta1_target * (1.0 - c)  # 0 -> target
-            beta2 = beta2_target * (1.0 - c)  # 0 -> target
-            return float(alpha), float(beta1), float(beta2)
+        def anneal_phi(tt: int, phi: float) -> float:
+            # Eq(7): piecewise
+            if tt < T1:
+                return 1.0
+            if tt < T2:
+                # 0.5 + 0.5 cos( pi * (T3 - T1) / (T3 - t*phi*(T3-T2)/(T2-T1)) )
+                denom = T3 - (tt * phi) * (T3 - T2) / max(1.0, (T2 - T1))
+                # avoid numerical issues (very small denom)
+                denom = max(1e-12, float(denom))
+                return 0.5 + 0.5 * math.cos(math.pi * (T3 - T1) / denom)
+            # tt >= T2 (and also for tt >= T3)
+            return 0.9
 
-        # t >= T2
-        return alpha_target, beta1_target, beta2_target
+        def map_1_to_target(a: float, target: float) -> float:
+            # a in [0.9, 1]  -> progress p in [0, 1] where p=1 at a=1, p=0 at a=0.9
+            p = (a - 0.9) / 0.1
+            p = min(1.0, max(0.0, p))
+            return target + (1.0 - target) * p  # 1 -> target as a decreases
+
+        def map_0_to_target(a: float, target: float) -> float:
+            # a in [0.9, 1] -> q in [0, 1] where q=0 at a=1, q=1 at a=0.9
+            q = 1.0 - (a - 0.9) / 0.1
+            q = min(1.0, max(0.0, q))
+            return target * q  # 0 -> target as a decreases
+
+        a_alpha = anneal_phi(t, phi_alpha)
+        a_beta1 = anneal_phi(t, phi_beta1)
+        a_beta2 = anneal_phi(t, phi_beta2)
+
+        alpha = map_1_to_target(a_alpha, alpha_target)  # 1 -> 0.5
+        beta1 = map_1_to_target(a_beta1, beta1_target)  # 1 -> 0.9
+        beta2 = map_0_to_target(a_beta2, beta2_target)  # 0 -> 0.01
+
+        return float(alpha), float(beta1), float(beta2)
 
     @torch.no_grad()
     def zo_adamu_prepare_directions(self, random_seed: int):
@@ -1201,13 +1232,6 @@ class OurTrainer(Trainer):
         Returns loss at theta + eps*m (same behavior as zo_step).
         """
         args = self.args
-        t = int(self.state.global_step)
-        max_steps = int(getattr(self.args, "max_steps", 0) or 0)
-        default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
-        T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
-        if t < T1:
-            return self.zo_subspace_step(model, inputs)
-
         # What parameters to optimize
         self.named_parameters_to_optim = []
         for name, param in model.named_parameters():
@@ -1278,6 +1302,7 @@ class OurTrainer(Trainer):
         self.zo_random_seed = int(np.random.randint(1000000000))
 
         # Prepare momentum-biased directions for this step (low-dim for subspace params)
+        t = int(self.state.global_step)
         alpha, beta1, _ = self.zo_adamu_anneal(t)
         alpha = float(min(1.0, max(0.0, alpha)))
         # cache for perturb/update
@@ -1287,19 +1312,19 @@ class OurTrainer(Trainer):
         # Cache per-parameter directions for this step
         self._subzo_cache_dirs()
 
-        # First function evaluation: f(theta + eps*m)
-        debug_check = (
-            self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
-        )
-        if debug_check:
-            dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = (
-                self.named_parameters_to_optim[0]
-            )
-            dbg_base = dbg_param.data.clone()
+        # # First function evaluation: f(theta + eps*m)
+        # debug_check = (
+        #     self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
+        # )
+        # if debug_check:
+        #     dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = (
+        #         self.named_parameters_to_optim[0]
+        #     )
+        #     dbg_base = dbg_param.data.clone()
 
         self.subzero_adamu_perturb_parameters(scaling_factor=1.0)
-        if debug_check:
-            dbg_delta_pos = (dbg_param.data - dbg_base).detach()
+        # if debug_check:
+        #     dbg_delta_pos = (dbg_param.data - dbg_base).detach()
         loss1 = self.zo_forward(model, inputs)
 
         assert args.q == 1, "only support q=1 for now."
@@ -1311,10 +1336,10 @@ class OurTrainer(Trainer):
         else:
             # theta+eps*m -> theta-eps*m
             self.subzero_adamu_perturb_parameters(scaling_factor=-2.0)
-            if debug_check:
-                dbg_delta_neg = (dbg_param.data - dbg_base).detach()
-                max_abs = (dbg_delta_pos + dbg_delta_neg).abs().max().item()
-                print(f"SubZO-AdaMU two-side dir check max_abs={max_abs:.3e}")
+            # if debug_check:
+            #     dbg_delta_neg = (dbg_param.data - dbg_base).detach()
+            #     max_abs = (dbg_delta_pos + dbg_delta_neg).abs().max().item()
+            #     print(f"SubZO-AdaMU two-side dir check max_abs={max_abs:.3e}")
             loss2 = self.zo_forward(model, inputs)
             self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
 
@@ -1333,14 +1358,6 @@ class OurTrainer(Trainer):
         where ghat = projected_grad, m_step is the SAME direction used for both +/- perturbations.
         After update, set st["m"] <- st["m_step"] for next iteration (Eq.(4) recursion).
         """
-        t = int(self.state.global_step)
-        max_steps = int(getattr(self.args, "max_steps", 0) or 0)
-        default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
-        T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
-        if t < T1:
-            self.zo_subspace_update(model)
-            return
-
         lr = float(self._get_learning_rate())
         g = float(self.projected_grad)
         wd = float(getattr(self.args, "weight_decay", 0.0) or 0.0)
