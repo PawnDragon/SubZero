@@ -432,7 +432,9 @@ class OurTrainer(Trainer):
         elif args.trainer in ["subzero_muon", "subzo_muon"]:
             # SubZO-Muon uses manual gradient injection; keep a simple SGD optimizer.
             self.optimizer = SGD(
-                self.model.parameters(), lr=args.learning_rate, momentum=0.0
+                self.model.parameters(),
+                lr=args.learning_rate,
+                momentum=args.momentum,
             )
             assert args.lr_scheduler_type == "constant", (
                 "we did not implement lr_schedule."
@@ -1160,6 +1162,10 @@ class OurTrainer(Trainer):
         std2 = math.sqrt(1.0 - alpha) if alpha < 1.0 else 0.0
 
         ns_steps = int(getattr(self.args, "subzo_muon_ns_steps", 5))
+        t = int(self.state.global_step)
+        max_steps = int(getattr(self.args, "max_steps", 0) or 0)
+        default_T2 = int(max_steps * 0.4) if max_steps > 0 else 5000
+        T2 = int(getattr(self.args, "zo_adamu_T2", None) or default_T2)
 
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
@@ -1209,6 +1215,8 @@ class OurTrainer(Trainer):
             if not is_subspace and self.args.trainer in [
                 "subzero_adamu",
                 "subzo_adamu",
+                "subzero_muon",
+                "subzo_muon",
             ]:
                 st["m_step"] = n1
             else:
@@ -1216,7 +1224,7 @@ class OurTrainer(Trainer):
                 z_ddot = st["m"] + n2 * std2
                 st["m_step"] = beta1 * z_dot + (1.0 - beta1) * z_ddot
 
-            if self.args.trainer in ["subzero_muon", "subzo_muon"]:
+            if self.args.trainer in ["subzero_muon", "subzo_muon"] and t >= T2:
                 if st["m_step"].ndim == 2:
                     O = zeropower_via_newtonschulz5(st["m_step"], steps=ns_steps)
                     O = O * math.sqrt(max(1.0, O.size(-2) / O.size(-1)))
@@ -1500,19 +1508,19 @@ class OurTrainer(Trainer):
         # Cache per-parameter directions for this step (m_step and O_step)
         self._subzo_cache_dirs()
 
-        # First function evaluation: f(theta + eps*O_step)
-        debug_check = (
-            self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
-        )
-        if debug_check:
-            dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = (
-                self.named_parameters_to_optim[0]
-            )
-            dbg_base = dbg_param.data.clone()
+        # # First function evaluation: f(theta + eps*O_step)
+        # debug_check = (
+        #     self.state.global_step < 3 and self.args.perturbation_mode != "one_side"
+        # )
+        # if debug_check:
+        #     dbg_name, dbg_param, dbg_is_sub, dbg_U, dbg_V, _ = (
+        #         self.named_parameters_to_optim[0]
+        #     )
+        #     dbg_base = dbg_param.data.clone()
 
         self.subzero_muon_perturb_parameters(scaling_factor=1.0)
-        if debug_check:
-            dbg_delta_pos = (dbg_param.data - dbg_base).detach()
+        # if debug_check:
+        #     dbg_delta_pos = (dbg_param.data - dbg_base).detach()
         loss1 = self.zo_forward(model, inputs)
 
         assert args.q == 1, "only support q=1 for now."
@@ -1522,10 +1530,10 @@ class OurTrainer(Trainer):
             self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
         else:
             self.subzero_muon_perturb_parameters(scaling_factor=-2.0)
-            if debug_check:
-                dbg_delta_neg = (dbg_param.data - dbg_base).detach()
-                max_abs = (dbg_delta_pos + dbg_delta_neg).abs().max().item()
-                print(f"SubZO-Muon two-side dir check max_abs={max_abs:.3e}")
+            # if debug_check:
+            #     dbg_delta_neg = (dbg_param.data - dbg_base).detach()
+            #     max_abs = (dbg_delta_pos + dbg_delta_neg).abs().max().item()
+            #     print(f"SubZO-Muon two-side dir check max_abs={max_abs:.3e}")
             loss2 = self.zo_forward(model, inputs)
             self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
             self.subzero_muon_perturb_parameters(scaling_factor=1.0)
@@ -1564,7 +1572,8 @@ class OurTrainer(Trainer):
             self.optimizer.step()
             param.grad = None
 
-            st["m"] = st["m_step"].detach().clone()
+            if is_subspace or self.args.trainer not in ["subzero_muon", "subzo_muon"]:
+                st["m"] = st["m_step"].detach().clone()
             st.pop("m_step", None)
             st.pop("O_step", None)
 
