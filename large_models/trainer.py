@@ -933,8 +933,8 @@ class OurTrainer(Trainer):
           beta2:  0   -> beta2_target
         """
         max_steps = int(getattr(self.args, "max_steps", 0) or 0)
-        default_T1 = int(max_steps * 0.3) if max_steps > 0 else 1000
-        default_T2 = int(max_steps * 0.6) if max_steps > 0 else 5000
+        default_T1 = int(max_steps * 0.25) if max_steps > 0 else 1000
+        default_T2 = int(max_steps * 0.5) if max_steps > 0 else 5000
         default_T3 = int(max_steps) if max_steps > 0 else 10**9
 
         T1 = int(getattr(self.args, "zo_adamu_T1", None) or default_T1)
