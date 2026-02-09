@@ -1231,6 +1231,8 @@ class OurTrainer(Trainer):
                     st["O_step"] = O.to(dtype=st["m_step"].dtype)
                 else:
                     st["O_step"] = st["m_step"]
+            elif self.args.trainer in ["subzero_muon", "subzo_muon"]:
+                st["O_step"] = st["m_step"]
 
     @torch.no_grad()
     def subzero_adamu_step(self, model, inputs):
