@@ -9,6 +9,7 @@ from tensorboard.backend.event_processing import event_accumulator
 
 
 DEFAULT_LOSS_TAG = "train_loss"
+FALLBACK_LOSS_TAGS = ["loss/epoch"]
 DEFAULT_ACC_TAGS = ["accuracy/val", "accuracy/test"]
 
 
@@ -84,6 +85,12 @@ def main():
         help=f"Loss scalar tag (default: {DEFAULT_LOSS_TAG})",
     )
     ap.add_argument(
+        "--loss_fallbacks",
+        nargs="*",
+        default=FALLBACK_LOSS_TAGS,
+        help="Fallback loss tags to try if --loss_tag not found",
+    )
+    ap.add_argument(
         "--acc_tags",
         nargs="*",
         default=DEFAULT_ACC_TAGS,
@@ -120,7 +127,20 @@ def main():
             plot_loss(loss_df, args.loss_tag, loss_png, title=args.loss_tag)
             print(f"[ok] saved: {loss_png}")
     except KeyError as e:
-        print(f"[warn] {e}. Skip loss plot.")
+        print(f"[warn] {e}. Try fallbacks.")
+        loss_df = None
+        for tag in args.loss_fallbacks:
+            if tag not in available:
+                continue
+            df = load_scalar_df(ea, tag)
+            if df.empty:
+                continue
+            loss_df = df
+            plot_loss(loss_df, tag, loss_png, title=tag)
+            print(f"[ok] saved: {loss_png}")
+            break
+        if loss_df is None:
+            print("[warn] no loss curve plotted (no valid loss tags).")
 
     # ---- accuracy (val/test etc) ----
     acc_png = run_dir / "acc_curve.png"
