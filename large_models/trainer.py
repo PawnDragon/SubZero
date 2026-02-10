@@ -838,6 +838,7 @@ class OurTrainer(Trainer):
             self._maybe_log_save_evaluate(
                 tr_loss, model, trial, epoch, ignore_keys_for_eval
             )
+            self.writer.add_scalar("loss/epoch", float(tr_loss), epoch)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_tpu_available():
