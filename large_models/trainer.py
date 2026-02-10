@@ -1138,8 +1138,6 @@ class OurTrainer(Trainer):
         theta += scaling_factor * eps * m_step
         Strict paper(4): m_step is sampled once per step and must stay fixed for both +/- perturbations and the update.
         """
-        ratio_sum = 0.0
-        ratio_count = 0
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
             if is_subspace:
@@ -1168,8 +1166,11 @@ class OurTrainer(Trainer):
         max_steps = int(getattr(self.args, "max_steps", 0) or 0)
         default_T2 = int(max_steps * 0.4) if max_steps > 0 else 5000
         T2 = int(getattr(self.args, "zo_adamu_T2", None) or default_T2)
-        ratio_sum = 0.0
-        ratio_count = 0
+
+        fro_m_list = []
+        fro_o_list = []
+        ratio_list = []
+
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
             if "m" not in st and not (
@@ -1232,24 +1233,46 @@ class OurTrainer(Trainer):
                     O = zeropower_via_newtonschulz5(st["m_step"], steps=ns_steps)
                     O = O * math.sqrt(max(1.0, O.size(-2) / O.size(-1)))
                     st["O_step"] = O.to(dtype=st["m_step"].dtype)
-                    norm_m = torch.norm(st["m_step"])
-                    norm_O = torch.norm(st["O_step"])
-                    ratio_sum += float(norm_O / (norm_m + 1e-12))
-                    ratio_count += 1
                 else:
                     st["O_step"] = st["m_step"]
             elif self.args.trainer in ["subzero_muon", "subzo_muon"]:
                 st["O_step"] = st["m_step"]
 
-        if (
-            self.args.trainer in ["subzero_muon", "subzo_muon"]
-            and t >= T2
-            and ratio_count > 0
-        ):
-            ratio_avg = ratio_sum / ratio_count
+            if st["m_step"].ndim == 2:
+                fro_m = torch.norm(st["m_step"])
+                if self.args.trainer in ["subzero_muon", "subzo_muon"]:
+                    fro_o = torch.norm(st["O_step"])
+                    st["O_step"] = st["O_step"] * (fro_m / (fro_o + 1e-12))
+                    fro_o = fro_m
+                else:
+                    fro_o = fro_m
+
+                fro_m_list.append(float(fro_m))
+                fro_o_list.append(float(fro_o))
+                ratio_list.append(float(fro_o / (fro_m + 1e-12)))
+
+        if len(ratio_list) > 0:
+            ratio_tensor = torch.tensor(ratio_list)
+            fro_m_tensor = torch.tensor(fro_m_list)
+            fro_o_tensor = torch.tensor(fro_o_list)
+            ratio_mean = float(ratio_tensor.mean())
+            ratio_median = float(ratio_tensor.median())
+            ratio_max = float(ratio_tensor.max())
+            fro_m_mean = float(fro_m_tensor.mean())
+            fro_o_mean = float(fro_o_tensor.mean())
+            fro_m_median = float(fro_m_tensor.median())
+            fro_o_median = float(fro_o_tensor.median())
+            fro_m_max = float(fro_m_tensor.max())
+            fro_o_max = float(fro_o_tensor.max())
             print(
-                f"muon/norm_ratio_avg step={self.state.global_step} ratio={ratio_avg:.6e}"
+                "muon/norm_stats "
+                f"step={self.state.global_step} "
+                f"fro_m(mean/med/max)={fro_m_mean:.6e}/{fro_m_median:.6e}/{fro_m_max:.6e} "
+                f"fro_o(mean/med/max)={fro_o_mean:.6e}/{fro_o_median:.6e}/{fro_o_max:.6e} "
+                f"ratio(mean/med/max)={ratio_mean:.6e}/{ratio_median:.6e}/{ratio_max:.6e}"
             )
+            self._subzo_fro_m_mean = fro_m_mean
+            self._subzo_fro_o_mean = fro_o_mean
 
     @torch.no_grad()
     def subzero_adamu_step(self, model, inputs):
@@ -1388,6 +1411,11 @@ class OurTrainer(Trainer):
         lr = float(self._get_learning_rate())
         g = float(self.projected_grad)
         wd = float(getattr(self.args, "weight_decay", 0.0) or 0.0)
+        if hasattr(self, "_subzo_fro_m_mean"):
+            update_norm_proxy = lr * abs(g) * float(self._subzo_fro_m_mean)
+            print(
+                f"adamu/update_norm_proxy step={self.state.global_step} value={update_norm_proxy:.6e}"
+            )
 
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
@@ -1569,6 +1597,11 @@ class OurTrainer(Trainer):
         lr = float(self._get_learning_rate())
         g = float(self.projected_grad)
         wd = float(getattr(self.args, "weight_decay", 0.0) or 0.0)
+        if hasattr(self, "_subzo_fro_o_mean"):
+            update_norm_proxy = lr * abs(g) * float(self._subzo_fro_o_mean)
+            print(
+                f"muon/update_norm_proxy step={self.state.global_step} value={update_norm_proxy:.6e}"
+            )
 
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
