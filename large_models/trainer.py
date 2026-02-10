@@ -1238,7 +1238,7 @@ class OurTrainer(Trainer):
             elif self.args.trainer in ["subzero_muon", "subzo_muon"]:
                 st["O_step"] = st["m_step"]
 
-            if st["m_step"].ndim == 2:
+            if st["m_step"].ndim == 2 and t >= T2:
                 fro_m = torch.norm(st["m_step"])
                 if self.args.trainer in ["subzero_muon", "subzo_muon"]:
                     fro_o = torch.norm(st["O_step"])
@@ -1251,7 +1251,11 @@ class OurTrainer(Trainer):
                 fro_o_list.append(float(fro_o))
                 ratio_list.append(float(fro_o / (fro_m + 1e-12)))
 
-        if len(ratio_list) > 0:
+        if (
+            len(ratio_list) > 0
+            and self.args.trainer in ["subzero_muon", "subzo_muon"]
+            and t >= T2
+        ):
             ratio_tensor = torch.tensor(ratio_list)
             fro_m_tensor = torch.tensor(fro_m_list)
             fro_o_tensor = torch.tensor(fro_o_list)
@@ -1273,6 +1277,9 @@ class OurTrainer(Trainer):
             )
             self._subzo_fro_m_mean = fro_m_mean
             self._subzo_fro_o_mean = fro_o_mean
+        elif self.args.trainer in ["subzero_muon", "subzo_muon"] and t < T2:
+            if hasattr(self, "_subzo_fro_o_mean"):
+                delattr(self, "_subzo_fro_o_mean")
 
     @torch.no_grad()
     def subzero_adamu_step(self, model, inputs):
@@ -1597,7 +1604,11 @@ class OurTrainer(Trainer):
         lr = float(self._get_learning_rate())
         g = float(self.projected_grad)
         wd = float(getattr(self.args, "weight_decay", 0.0) or 0.0)
-        if hasattr(self, "_subzo_fro_o_mean"):
+        t = int(self.state.global_step)
+        max_steps = int(getattr(self.args, "max_steps", 0) or 0)
+        default_T2 = int(max_steps * 0.4) if max_steps > 0 else 5000
+        T2 = int(getattr(self.args, "zo_adamu_T2", None) or default_T2)
+        if hasattr(self, "_subzo_fro_o_mean") and t >= T2:
             update_norm_proxy = lr * abs(g) * float(self._subzo_fro_o_mean)
             print(
                 f"muon/update_norm_proxy step={self.state.global_step} value={update_norm_proxy:.6e}"
