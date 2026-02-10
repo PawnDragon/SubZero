@@ -43,7 +43,6 @@ from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
 from transformers.dependency_versions_check import dep_version_check
 from muon import SingleDeviceMuonWithAuxAdam as muon
-from muon import zeropower_via_newtonschulz5
 
 # Integrations must be imported before ML frameworks:
 from transformers.integrations import (  # isort: split
@@ -1138,6 +1137,8 @@ class OurTrainer(Trainer):
         theta += scaling_factor * eps * m_step
         Strict paper(4): m_step is sampled once per step and must stay fixed for both +/- perturbations and the update.
         """
+        ratio_sum = 0.0
+        ratio_count = 0
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
             if is_subspace:
@@ -1166,7 +1167,8 @@ class OurTrainer(Trainer):
         max_steps = int(getattr(self.args, "max_steps", 0) or 0)
         default_T2 = int(max_steps * 0.4) if max_steps > 0 else 5000
         T2 = int(getattr(self.args, "zo_adamu_T2", None) or default_T2)
-
+        ratio_sum = 0.0
+        ratio_count = 0
         for name, param, is_subspace, U, V, idx in self.named_parameters_to_optim:
             st = self.p_state[name]
             if "m" not in st and not (
@@ -1229,10 +1231,24 @@ class OurTrainer(Trainer):
                     O = zeropower_via_newtonschulz5(st["m_step"], steps=ns_steps)
                     O = O * math.sqrt(max(1.0, O.size(-2) / O.size(-1)))
                     st["O_step"] = O.to(dtype=st["m_step"].dtype)
+                    norm_m = torch.norm(st["m_step"])
+                    norm_O = torch.norm(st["O_step"])
+                    ratio_sum += float(norm_O / (norm_m + 1e-12))
+                    ratio_count += 1
                 else:
                     st["O_step"] = st["m_step"]
             elif self.args.trainer in ["subzero_muon", "subzo_muon"]:
                 st["O_step"] = st["m_step"]
+
+        if (
+            self.args.trainer in ["subzero_muon", "subzo_muon"]
+            and t >= T2
+            and ratio_count > 0
+        ):
+            ratio_avg = ratio_sum / ratio_count
+            print(
+                f"muon/norm_ratio_avg step={self.state.global_step} ratio={ratio_avg:.6e}"
+            )
 
     @torch.no_grad()
     def subzero_adamu_step(self, model, inputs):
@@ -2257,6 +2273,30 @@ class OurTrainer(Trainer):
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
             self.push_to_hub(commit_message="Model save")
+
+
+def zeropower_via_newtonschulz5(G, steps: int):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+    Keeps the original dtype (no bf16 cast).
+    """
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
 
 
 def fast_svd_method_v1(X, rank=8):
