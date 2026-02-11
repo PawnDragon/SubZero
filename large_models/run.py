@@ -632,6 +632,7 @@ def evaluate_dolly_rouge_l(
     do_sample=False,
     temperature=1.0,
     batch_size=1,
+    max_source_length=512,
 ):
     """
     Compute ROUGE-L for Dolly generation.
@@ -643,6 +644,17 @@ def evaluate_dolly_rouge_l(
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
+
+    num_virtual_tokens = 0
+    if hasattr(model, "prompt_encoder"):
+        num_virtual_tokens = int(getattr(model.prompt_encoder, "num_virtual_tokens", 0) or 0)
+    max_pos = int(getattr(model.config, "max_position_embeddings", 0) or 0)
+    if max_pos > 0:
+        max_source_length = min(
+            int(max_source_length),
+            max(1, max_pos - num_virtual_tokens - int(max_new_tokens)),
+        )
+    max_source_length = int(max_source_length)
 
     all_preds = []
     all_refs = []
@@ -668,7 +680,21 @@ def evaluate_dolly_rouge_l(
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
+                max_length=max_source_length,
             ).to(device)
+
+            if num_virtual_tokens > 0 and "attention_mask" in enc:
+                bsz = enc["attention_mask"].size(0)
+                prefix_mask = torch.ones(
+                    (bsz, num_virtual_tokens), device=enc["attention_mask"].device, dtype=enc["attention_mask"].dtype
+                )
+                enc["attention_mask"] = torch.cat((prefix_mask, enc["attention_mask"]), dim=1)
+
+            if i == 0:
+                print(
+                    f"generate shapes input_ids={tuple(enc['input_ids'].shape)} "
+                    f"attn={tuple(enc['attention_mask'].shape)} num_v={num_virtual_tokens}"
+                )
 
             outputs = model.generate(
                 **enc,
