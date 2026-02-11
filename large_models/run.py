@@ -23,8 +23,13 @@ from modeling_mistral import (
     MistralConfig
 )
 from tasks import get_task
+import tasks as tasks_module
 from trainer import OurTrainer
 from utils import *
+from templates import DollyTemplate
+
+# NOTE: requires `pip install evaluate rouge-score`
+import evaluate
 
 os.environ["TRANSFORMERS_CACHE"] = "./cache"
 
@@ -48,6 +53,7 @@ class OurArguments(TrainingArguments):
     num_train_sets: int = None  # how many sets of training samples/demos to sample; if None and train_set_seed is None, then we will sample one set for each evaluation sample
     train_set_seed: int = 0  # designated seed to sample training samples/demos
     result_file: str = None  # file name for saving performance; if None, then use the task name, model name, and config
+    dolly_data_path: str = "databricks-dolly-15k.jsonl"
 
     # Model loading
     model_name: str = "facebook/opt-125m"  # HuggingFace model name
@@ -419,6 +425,17 @@ class Framework:
         If one_train_set_per_eval_sample is True, then each eval sample has its own training (demonstration) set.
         Otherwise, the same training set is used for all eval samples.
         """
+        if self.task.get_task_name() == "Dolly":
+            return evaluate_dolly_rouge_l(
+                self.model,
+                self.tokenizer,
+                eval_samples,
+                device=self.model.device,
+                max_new_tokens=self.args.max_new_tokens,
+                num_beams=self.args.num_beams,
+                do_sample=self.args.sampling,
+                temperature=self.args.temperature,
+            )
         if one_train_set_per_eval_sample:
             logger.info(f"There are {len(eval_samples)} validation samples and one train set per eval sample")
         else:
@@ -435,6 +452,77 @@ class Framework:
         metric_name = getattr(self.task, "metric_name", "accuracy")
         metrics = {metric_name: calculate_metric(predictions, metric_name)}
         return metrics
+
+
+def evaluate_dolly_rouge_l(
+    model,
+    tokenizer,
+    samples,
+    device,
+    max_new_tokens=128,
+    num_beams=1,
+    do_sample=False,
+    temperature=1.0,
+    batch_size=1,
+):
+    """
+    Compute ROUGE-L for Dolly generation.
+    Returns dict: {"rougeL": float, "num_samples": int, "avg_gen_len": float}
+    """
+    rouge = evaluate.load("rouge")
+    template = DollyTemplate()
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    all_preds = []
+    all_refs = []
+    gen_lens = []
+
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, len(samples), batch_size):
+            batch = samples[i : i + batch_size]
+            prompts = []
+            prompt_lens = []
+            refs = []
+
+            for sample in batch:
+                prompt, target = template.format_sample(sample)
+                prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+                prompts.append(prompt)
+                prompt_lens.append(len(prompt_ids))
+                refs.append(str(target).strip())
+
+            enc = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to(device)
+
+            outputs = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                num_beams=num_beams,
+                pad_token_id=pad_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+            for j, out_ids in enumerate(outputs):
+                gen_ids = out_ids[prompt_lens[j] :]
+                gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+                all_preds.append(gen_text)
+                all_refs.append(refs[j])
+                gen_lens.append(len(gen_ids))
+
+    scores = rouge.compute(predictions=all_preds, references=all_refs, rouge_types=["rougeL"])
+    rouge_l = float(scores["rougeL"])
+    avg_gen_len = float(sum(gen_lens) / max(1, len(gen_lens)))
+    return {"rougeL": rouge_l, "num_samples": int(len(all_preds)), "avg_gen_len": avg_gen_len}
 
     def train(self, train_samples, dev_samples, eval_samples, writer):
         """
@@ -462,12 +550,29 @@ class Framework:
             """
             data = []
             for sample in samples:
-                encoded_candidates, option_lens = encode_prompt(self.task, self.task.get_template(
-                    template_version=self.args.template_ver), [], sample,
-                                                                self.tokenizer, max_length=self.args.max_length,
-                                                                generation=self.task.generation,
-                                                                generation_with_gold=True,
-                                                                max_new_tokens=self.args.max_new_tokens)
+                if (
+                    self.task.generation
+                    and isinstance(sample.data, dict)
+                    and "instruction" in sample.data
+                    and "response" in sample.data
+                ):
+                    tokenized = tokenize_and_mask_dolly(
+                        sample, self.tokenizer, self.args.max_length, add_eos=True
+                    )
+                    data.append(tokenized)
+                    continue
+
+                encoded_candidates, option_lens = encode_prompt(
+                    self.task,
+                    self.task.get_template(template_version=self.args.template_ver),
+                    [],
+                    sample,
+                    self.tokenizer,
+                    max_length=self.args.max_length,
+                    generation=self.task.generation,
+                    generation_with_gold=True,
+                    max_new_tokens=self.args.max_new_tokens,
+                )
                 if self.task.generation:
                     correct_candidate_id = 0
                 elif isinstance(sample.correct_candidate, list):
@@ -613,6 +718,7 @@ def main():
     
     writer = SummaryWriter(tensorboard_log_dir)
     set_seed(args.seed)
+    tasks_module.DOLLY_DATA_PATH = args.dolly_data_path
     task = get_task(args.task_name)
 
     # This function samples both training and validation samples. The validation (dev) samples are also stored in "train_sets"

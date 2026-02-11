@@ -195,6 +195,53 @@ def encode_prompt(task, template, train_samples, eval_sample, tokenizer, max_len
     return encodings, option_lens
 
 
+def tokenize_and_mask_dolly(sample_or_data, tokenizer, max_length, add_eos=True):
+    """
+    Tokenize Dolly-style instruction data with prompt/target split and label masking.
+    Labels are -100 for prompt tokens and target token ids for response tokens.
+    """
+    if hasattr(sample_or_data, "data"):
+        data = sample_or_data.data
+    else:
+        data = sample_or_data
+
+    instr = str(data.get("instruction", "")).strip()
+    ctx = str(data.get("context", "")).strip()
+    resp = str(data.get("response", "")).strip()
+
+    prompt = f"### Instruction:\n{instr}\n\n"
+    if ctx:
+        prompt += f"### Context:\n{ctx}\n\n"
+    prompt += "### Response:\n"
+
+    prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+    target_ids = tokenizer(resp, add_special_tokens=False).input_ids
+
+    if add_eos and tokenizer.eos_token_id is not None:
+        if len(target_ids) == 0 or target_ids[-1] != tokenizer.eos_token_id:
+            target_ids = target_ids + [tokenizer.eos_token_id]
+
+    # Truncate to max_length while keeping prompt and as much target as possible
+    total_len = len(prompt_ids) + len(target_ids)
+    if total_len > max_length:
+        if len(prompt_ids) >= max_length:
+            prompt_ids = prompt_ids[-max_length:]
+            target_ids = []
+        else:
+            avail = max_length - len(prompt_ids)
+            target_ids = target_ids[:avail]
+
+    input_ids = prompt_ids + target_ids
+    labels = [-100] * len(prompt_ids) + target_ids
+    attention_mask = [1] * len(input_ids)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
 @dataclass
 class ICLCollator:
     """

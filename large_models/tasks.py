@@ -1,5 +1,7 @@
 import logging
 import sys
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Union
 
@@ -11,6 +13,9 @@ from utils import temp_seed
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Default local path for Dolly jsonl; can be overridden by run.py
+DOLLY_DATA_PATH = "databricks-dolly-15k.jsonl"
 
 
 def get_task(task_name):
@@ -483,3 +488,43 @@ class WinoGrandeDataset(Dataset):
             return WinoGrandeTemplate()
         else:
             raise NotImplementedError(f"Template version {template_version} not implemented for WinoGrande")
+
+
+class DollyDataset(Dataset):
+    train_sep = "\n\n"
+    generation = True
+
+    def __init__(self, subtask=None, **kwargs) -> None:
+        self.load_dataset(subtask, **kwargs)
+
+    def load_dataset(self, path=None, **kwargs):
+        d = load_dataset("databricks/databricks-dolly-15k")
+        train_d = d["train"]
+        split = train_d.train_test_split(test_size=0.05, seed=42)
+        train_set = split["train"]
+        valid_set = split["test"]
+
+        train_samples = [
+            self.build_sample(example, idx) for idx, example in enumerate(train_set)
+        ]
+        valid_samples = [
+            self.build_sample(example, idx) for idx, example in enumerate(valid_set)
+        ]
+
+        self.samples = {"train": train_samples, "valid": valid_samples}
+
+    def build_sample(self, example, idx):
+        return Sample(
+            id=idx,
+            data={
+                "instruction": example.get("instruction", ""),
+                "context": example.get("context", ""),
+                "response": example.get("response", ""),
+                "category": example.get("category", ""),
+            },
+            candidates=[],
+            correct_candidate=None,
+        )
+
+    def get_template(self, template_version=0):
+        return {0: DollyTemplate}[template_version]()

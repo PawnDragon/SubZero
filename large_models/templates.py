@@ -24,6 +24,32 @@ class Template:
         return candidate
 
 
+class DollyTemplate(Template):
+    def format_sample(self, sample):
+        instr = sample.data.get("instruction", "").strip()
+        ctx = sample.data.get("context", "").strip()
+        resp = sample.data.get("response", "").strip()
+        prompt = f"### Instruction:\n{instr}\n\n"
+        if ctx:
+            prompt += f"### Context:\n{ctx}\n\n"
+        prompt += "### Response:\n"
+        return prompt, resp
+
+    def encode(self, sample):
+        prompt, _ = self.format_sample(sample)
+        return prompt
+
+    def verbalize(self, sample, candidate):
+        prompt, target = self.format_sample(sample)
+        return prompt + target
+
+    def encode_sfc(self, sample):
+        return self.encode(sample)
+
+    def verbalize_sfc(self, sample, candidate):
+        return self.verbalize(sample, candidate)
+
+
 class SST2Template(Template):
     verbalizer = {0: "terrible", 1: "great"}
 
