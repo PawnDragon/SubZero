@@ -260,9 +260,17 @@ class Framework:
         if "opt" in self.args.model_name:
             tokenizer.bos_token_id = 0
 
+        # Ensure pad_token_id exists (needed for padding/collator)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+            tokenizer.pad_token = tokenizer.eos_token
+
         if ("llama" in self.args.model_name) or ("mistral" in self.args.model_name.lower()):
             # LLaMA padding token
             tokenizer.pad_token_id = 0  # technically <unk>
+
+        if getattr(model.config, "pad_token_id", None) is None:
+            model.config.pad_token_id = tokenizer.pad_token_id
 
         # Prefix tuning/LoRA
         if self.args.prefix_tuning:
