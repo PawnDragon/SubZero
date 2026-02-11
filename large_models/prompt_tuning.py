@@ -72,10 +72,19 @@ def _model_forward_hook(
         past_key_values = kwargs.get("past_key_value", None)
     is_prefill = past_key_values is None
     if attention_mask is not None:
-        # concat prompt attention mask only for prefill
+        # concat prompt attention mask only for prefill (and only if not already extended)
         if is_prefill:
-            prefix_attention_mask = torch.ones(batch_size, num_virtual_tokens).to(attention_mask.device)
-            attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
+            seq_len = None
+            if input_ids is not None:
+                seq_len = input_ids.shape[1]
+            elif inputs_embeds is not None:
+                seq_len = inputs_embeds.shape[1]
+            already_extended = (
+                seq_len is not None and attention_mask.shape[1] == seq_len + num_virtual_tokens
+            )
+            if not already_extended:
+                prefix_attention_mask = torch.ones(batch_size, num_virtual_tokens).to(attention_mask.device)
+                attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
     if kwargs.get("position_ids", None) is not None:
         warnings.warn("Position ids are not supported for parameter efficient tuning. Ignoring position ids.")
         kwargs["position_ids"] = None
