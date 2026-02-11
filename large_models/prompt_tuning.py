@@ -67,10 +67,15 @@ def _model_forward_hook(
 ):
     batch_size = _get_batch_size(input_ids, inputs_embeds)
     num_virtual_tokens = self.prompt_encoder.num_virtual_tokens
+    past_key_values = kwargs.get("past_key_values", None)
+    if past_key_values is None:
+        past_key_values = kwargs.get("past_key_value", None)
+    is_prefill = past_key_values is None
     if attention_mask is not None:
-        # concat prompt attention mask
-        prefix_attention_mask = torch.ones(batch_size, num_virtual_tokens).to(attention_mask.device)
-        attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
+        # concat prompt attention mask only for prefill
+        if is_prefill:
+            prefix_attention_mask = torch.ones(batch_size, num_virtual_tokens).to(attention_mask.device)
+            attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
     if kwargs.get("position_ids", None) is not None:
         warnings.warn("Position ids are not supported for parameter efficient tuning. Ignoring position ids.")
         kwargs["position_ids"] = None
@@ -115,11 +120,23 @@ def _model_forward_hook(
     if inputs_embeds is None:
         inputs_embeds = embedding_module(input_ids.to(embedding_module_device_refer.device))
         inputs_embeds = inputs_embeds.to(input_device)
-    prompts = torch.arange(num_virtual_tokens).unsqueeze(0).expand(batch_size, -1).to(
-        self.prompt_encoder.embedding.weight.device)
-    prompts = self.prompt_encoder(prompts).to(dtype=inputs_embeds.dtype, device=input_device)
+    if is_prefill:
+        prompts = torch.arange(num_virtual_tokens).unsqueeze(0).expand(batch_size, -1).to(
+            self.prompt_encoder.embedding.weight.device)
+        prompts = self.prompt_encoder(prompts).to(dtype=inputs_embeds.dtype, device=input_device)
+        inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
 
-    inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
+    if getattr(self, "_prompt_tuning_debug", False):
+        if not hasattr(self, "_prompt_tuning_debug_count"):
+            self._prompt_tuning_debug_count = 0
+        if self._prompt_tuning_debug_count < 5:
+            attn_shape = tuple(attention_mask.shape) if attention_mask is not None else None
+            emb_shape = tuple(inputs_embeds.shape) if inputs_embeds is not None else None
+            print(
+                f"prompt_tuning_hook prefill={is_prefill} "
+                f"inputs_embeds={emb_shape} attention_mask={attn_shape}"
+            )
+            self._prompt_tuning_debug_count += 1
 
     outputs = self.prompt_tuning_original_forward(inputs_embeds=inputs_embeds, **kwargs)
     if hide_virtual_token_logits and hasattr(outputs, "logits"):
