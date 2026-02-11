@@ -528,3 +528,7 @@ class DollyDataset(Dataset):
 
     def get_template(self, template_version=0):
         return {0: DollyTemplate}[template_version]()
+
+
+# Alias for task_name compatibility (e.g., "DOLLY")
+DOLLYDataset = DollyDataset
