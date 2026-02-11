@@ -500,7 +500,7 @@ class DollyDataset(Dataset):
     def load_dataset(self, path=None, **kwargs):
         d = load_dataset("databricks/databricks-dolly-15k")
         train_d = d["train"]
-        split = train_d.train_test_split(test_size=0.05, seed=42)
+        split = train_d.train_test_split(test_size=0.10, seed=42)
         train_set = split["train"]
         valid_set = split["test"]
 
