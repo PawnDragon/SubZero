@@ -149,7 +149,9 @@ def _model_forward_hook(
 
     outputs = self.prompt_tuning_original_forward(inputs_embeds=inputs_embeds, **kwargs)
     if hide_virtual_token_logits and hasattr(outputs, "logits"):
-        outputs.logits = outputs.logits[..., num_virtual_tokens:, :]
+        # Only hide virtual token logits on prefill or when sequence is long enough.
+        if is_prefill or outputs.logits.size(-2) > num_virtual_tokens:
+            outputs.logits = outputs.logits[..., num_virtual_tokens:, :]
     return outputs
 
 
