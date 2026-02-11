@@ -454,76 +454,6 @@ class Framework:
         return metrics
 
 
-def evaluate_dolly_rouge_l(
-    model,
-    tokenizer,
-    samples,
-    device,
-    max_new_tokens=128,
-    num_beams=1,
-    do_sample=False,
-    temperature=1.0,
-    batch_size=1,
-):
-    """
-    Compute ROUGE-L for Dolly generation.
-    Returns dict: {"rougeL": float, "num_samples": int, "avg_gen_len": float}
-    """
-    rouge = evaluate.load("rouge")
-    template = DollyTemplate()
-
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id
-
-    all_preds = []
-    all_refs = []
-    gen_lens = []
-
-    model.eval()
-    with torch.no_grad():
-        for i in range(0, len(samples), batch_size):
-            batch = samples[i : i + batch_size]
-            prompts = []
-            prompt_lens = []
-            refs = []
-
-            for sample in batch:
-                prompt, target = template.format_sample(sample)
-                prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
-                prompts.append(prompt)
-                prompt_lens.append(len(prompt_ids))
-                refs.append(str(target).strip())
-
-            enc = tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-            ).to(device)
-
-            outputs = model.generate(
-                **enc,
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature,
-                num_beams=num_beams,
-                pad_token_id=pad_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-            for j, out_ids in enumerate(outputs):
-                gen_ids = out_ids[prompt_lens[j] :]
-                gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-                all_preds.append(gen_text)
-                all_refs.append(refs[j])
-                gen_lens.append(len(gen_ids))
-
-    scores = rouge.compute(predictions=all_preds, references=all_refs, rouge_types=["rougeL"])
-    rouge_l = float(scores["rougeL"])
-    avg_gen_len = float(sum(gen_lens) / max(1, len(gen_lens)))
-    return {"rougeL": rouge_l, "num_samples": int(len(all_preds)), "avg_gen_len": avg_gen_len}
-
     def train(self, train_samples, dev_samples, eval_samples, writer):
         """
         Training function
@@ -678,6 +608,77 @@ def evaluate_dolly_rouge_l(
         for f in deleted_folders:
             shutil.rmtree(os.path.join(self.args.output_dir, f))
         print(f"deleted folders: ", deleted_folders)
+
+
+def evaluate_dolly_rouge_l(
+    model,
+    tokenizer,
+    samples,
+    device,
+    max_new_tokens=128,
+    num_beams=1,
+    do_sample=False,
+    temperature=1.0,
+    batch_size=1,
+):
+    """
+    Compute ROUGE-L for Dolly generation.
+    Returns dict: {"rougeL": float, "num_samples": int, "avg_gen_len": float}
+    """
+    rouge = evaluate.load("rouge")
+    template = DollyTemplate()
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    all_preds = []
+    all_refs = []
+    gen_lens = []
+
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, len(samples), batch_size):
+            batch = samples[i : i + batch_size]
+            prompts = []
+            prompt_lens = []
+            refs = []
+
+            for sample in batch:
+                prompt, target = template.format_sample(sample)
+                prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+                prompts.append(prompt)
+                prompt_lens.append(len(prompt_ids))
+                refs.append(str(target).strip())
+
+            enc = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to(device)
+
+            outputs = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                num_beams=num_beams,
+                pad_token_id=pad_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+            for j, out_ids in enumerate(outputs):
+                gen_ids = out_ids[prompt_lens[j] :]
+                gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+                all_preds.append(gen_text)
+                all_refs.append(refs[j])
+                gen_lens.append(len(gen_ids))
+
+    scores = rouge.compute(predictions=all_preds, references=all_refs, rouge_types=["rougeL"])
+    rouge_l = float(scores["rougeL"])
+    avg_gen_len = float(sum(gen_lens) / max(1, len(gen_lens)))
+    return {"rougeL": rouge_l, "num_samples": int(len(all_preds)), "avg_gen_len": avg_gen_len}
 
 
 def result_file_tag(args):
