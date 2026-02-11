@@ -221,15 +221,15 @@ def tokenize_and_mask_dolly(sample_or_data, tokenizer, max_length, add_eos=True)
         if len(target_ids) == 0 or target_ids[-1] != tokenizer.eos_token_id:
             target_ids = target_ids + [tokenizer.eos_token_id]
 
-    # Truncate to max_length while keeping prompt and as much target as possible
+    # Truncate to max_length while keeping prompt and at least one target token if possible
     total_len = len(prompt_ids) + len(target_ids)
     if total_len > max_length:
-        if len(prompt_ids) >= max_length:
-            prompt_ids = prompt_ids[-max_length:]
-            target_ids = []
-        else:
-            avail = max_length - len(prompt_ids)
-            target_ids = target_ids[:avail]
+        min_target = 1 if len(target_ids) > 0 else 0
+        if max_length > 0 and len(prompt_ids) >= max_length - min_target:
+            keep = max(0, max_length - min_target)
+            prompt_ids = prompt_ids[-keep:] if keep > 0 else []
+        avail = max_length - len(prompt_ids)
+        target_ids = target_ids[: max(0, avail)]
 
     input_ids = prompt_ids + target_ids
     if len(input_ids) > 0:
