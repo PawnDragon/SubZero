@@ -495,6 +495,7 @@ class DollyDataset(Dataset):
     generation = True
 
     def __init__(self, subtask=None, **kwargs) -> None:
+        super().__init__(subtask or "Dolly", **kwargs)
         self.load_dataset(subtask, **kwargs)
 
     def load_dataset(self, path=None, **kwargs):
