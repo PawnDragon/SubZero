@@ -468,8 +468,12 @@ class Framework:
         if self.num_dev is not None, eval_samples are dev_samples
         """
         logger.info(f"Eval sample length is {len(eval_samples)}")
-        # Set tokenizer to left padding (so that all the options are right aligned)
-        self.tokenizer.padding_side = "left"
+        # Set tokenizer padding side
+        if self.task.generation:
+            self.tokenizer.padding_side = "right"
+        else:
+            # So that all the options are right aligned
+            self.tokenizer.padding_side = "left"
 
         class HFDataset(Dataset):
 

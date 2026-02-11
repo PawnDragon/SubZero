@@ -232,6 +232,14 @@ def tokenize_and_mask_dolly(sample_or_data, tokenizer, max_length, add_eos=True)
             target_ids = target_ids[:avail]
 
     input_ids = prompt_ids + target_ids
+    if len(input_ids) > 0:
+        max_id = max(input_ids)
+        if max_id >= tokenizer.vocab_size:
+            raise ValueError(
+                f"Token id out of range: max_id={max_id} vocab_size={tokenizer.vocab_size}"
+            )
+        if min(input_ids) < 0:
+            raise ValueError("Token id out of range: found negative id")
     labels = [-100] * len(prompt_ids) + target_ids
     attention_mask = [1] * len(input_ids)
 
