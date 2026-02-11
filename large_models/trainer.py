@@ -1840,6 +1840,19 @@ class OurTrainer(Trainer):
 
         with torch.inference_mode():
             inputs = self._prepare_inputs(inputs)
+            # Debug: log label token coverage once per step
+            step = int(self.state.global_step)
+            if getattr(self, "_label_stat_step", -1) != step:
+                self._label_stat_step = step
+                if isinstance(inputs, dict) and "labels" in inputs:
+                    labels = inputs["labels"]
+                    if torch.is_tensor(labels):
+                        valid = int((labels != -100).sum().item())
+                        total = int(labels.numel())
+                        if valid == 0 or step % 50 == 0:
+                            print(
+                                f"label_tokens step={step} valid={valid} total={total}"
+                            )
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
             if self.args.n_gpu > 1:
