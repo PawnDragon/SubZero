@@ -542,7 +542,7 @@ class Framework:
             eval_dataset = HFDataset(_convert(eval_samples))
             dev_dataset = HFDataset(_convert(dev_samples))
 
-        if self.args.only_train_option and not self.args.non_diff:
+        if self.args.only_train_option and not self.args.non_diff and not self.task.generation:
             # If --only_train_option and not with a non-differentiable objective, we wrap the forward function
             self.model.original_forward = self.model.forward
             self.model.forward = forward_wrap_with_option_len.__get__(self.model, type(self.model))
