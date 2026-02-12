@@ -81,6 +81,7 @@ class OurArguments(TrainingArguments):
     ## - subzero_sgd: SubZero training
     ## - subzero_adamu: SubZO-AdaMU training
     ## - submuon: first-order Subspace Muon
+    ## - subsgd: subspace SGD (FO) on core X
     ## - zo_sign_opt: zeroth-order sign sgd training
     ## - forward_grad: forward gradient
     ## (add) -zo_sgd_svd 
@@ -308,7 +309,7 @@ class Framework:
                 sum(p.numel() for p in model.parameters() if p.requires_grad),
             ))
 
-        if self.args.trainer == "submuon":
+        if self.args.trainer in ["submuon", "subsgd"]:
             from submuon import inject_submuon_linear
             inject_submuon_linear(model, rank=self.args.gauss_rank)
 

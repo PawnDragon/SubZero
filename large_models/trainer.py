@@ -446,6 +446,12 @@ class OurTrainer(Trainer):
             assert args.lr_scheduler_type == "constant", (
                 "we did not implement lr_schedule."
             )
+        elif args.trainer == "subsgd":
+            # SubSGD uses manual updates on core parameters.
+            self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate)
+            assert args.lr_scheduler_type == "constant", (
+                "we did not implement lr_schedule."
+            )
         elif args.trainer == "zo_sgd":
             self.optimizer = SGD(
                 self.model.parameters(), lr=args.learning_rate, momentum=args.momentum
@@ -693,6 +699,8 @@ class OurTrainer(Trainer):
                         raise ValueError(f"q={args.q} is not supported.")
                 elif args.trainer == "submuon":
                     tr_loss_step = self.submuon_step(model, inputs)
+                elif args.trainer == "subsgd":
+                    tr_loss_step = self.subsgd_step(model, inputs)
                 elif args.trainer in ["subzero_sgd"]:
                     if args.q == 1:
                         tr_loss_step = self.zo_subspace_step(model, inputs)
@@ -750,6 +758,8 @@ class OurTrainer(Trainer):
                         self.subzero_muon_update(model)
                     elif args.trainer == "submuon":
                         self.submuon_update(model)
+                    elif args.trainer == "subsgd":
+                        self.subsgd_update(model)
                     elif args.trainer == "subzero_sgd":
                         self.zo_subspace_update(model)
                     elif args.trainer == "forward_grad":
@@ -1262,6 +1272,106 @@ class OurTrainer(Trainer):
                     delta = M_fp32 @ invsqrt
 
             module.X.add_(delta.to(module.X.dtype), alpha=-lr)
+            module.X.grad = None
+
+        self.update_steps += 1
+        if self.update_steps % 1000 == 0:
+            print("model update:", self.update_steps)
+        self.lr_scheduler.step()
+
+    ########################
+    # SubSGD (FO + subspace)
+    ########################
+
+    def subsgd_prepare_layers(self, model):
+        if getattr(self, "_subsgd_prepared", False):
+            return
+        self._subsgd_prepared = True
+        self.subsgd_layers = []
+
+        # Freeze all parameters by default
+        for p in model.parameters():
+            p.requires_grad = False
+
+        for name, module in model.named_modules():
+            if isinstance(module, SubMuonLinear):
+                st = self.p_state.setdefault(name, {})
+                st["module"] = module
+                self.subsgd_layers.append((name, module))
+                module.X.requires_grad = True
+
+    @torch.no_grad()
+    def _subsgd_refresh_basis_and_project(self, module, st, w_shape):
+        args = self.args
+        U_old = module.U
+        V_old = module.V
+        U_new, V_new = fast_svd_method_v2(
+            w_shape=w_shape,
+            device=module.U.device,
+            dtype=module.U.dtype,
+            rank=args.gauss_rank,
+        )
+
+        do_dbg = args.debug_submuon_projection and getattr(self, "_subsgd_proj_dbg", 0) < 2
+        if do_dbg:
+            self._subsgd_proj_dbg = getattr(self, "_subsgd_proj_dbg", 0) + 1
+            X_old = module.X.data.clone()
+            delta_old = U_old @ X_old @ V_old
+
+        R_U = U_new.T @ U_old
+        R_V = V_new @ V_old.T
+        module.X.data = R_U @ module.X.data @ R_V
+
+        module.U.copy_(U_new)
+        module.V.copy_(V_new)
+
+        if do_dbg:
+            delta_new = module.U @ module.X.data @ module.V
+            max_abs = (delta_old - delta_new).abs().max().item()
+            print(f"subsgd projection max_abs={max_abs:.3e}")
+
+    def subsgd_step(self, model, inputs):
+        """
+        First-order SubSGD step: forward + backward on core X parameters.
+        """
+        self.subsgd_prepare_layers(model)
+        args = self.args
+
+        # Refresh subspace bases on schedule
+        if args.update_interval > 0 and self.state.global_step % args.update_interval == 0:
+            for name, module in self.subsgd_layers:
+                st = self.p_state[name]
+                w_shape = module.weight.shape
+                self._subsgd_refresh_basis_and_project(module, st, w_shape)
+
+        if not hasattr(self, "_subsgd_accum_step"):
+            self._subsgd_accum_step = 0
+        if self._subsgd_accum_step % args.gradient_accumulation_steps == 0:
+            model.zero_grad(set_to_none=True)
+        self._subsgd_accum_step += 1
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        if args.n_gpu > 1:
+            loss = loss.mean()
+        loss = loss / args.gradient_accumulation_steps
+        loss.backward()
+        return loss.detach()
+
+    @torch.no_grad()
+    def subsgd_update(self, model):
+        """
+        Update SubSGD core parameters X with plain SGD.
+        """
+        self.subsgd_prepare_layers(model)
+        lr = float(self._get_learning_rate())
+
+        for name, module in self.subsgd_layers:
+            if module.X.grad is None:
+                continue
+            module.X.add_(module.X.grad, alpha=-lr)
             module.X.grad = None
 
         self.update_steps += 1
