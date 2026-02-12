@@ -38,6 +38,8 @@ from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
+
+from submuon import SubMuonLinear
 from transformers import Trainer
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
@@ -438,6 +440,12 @@ class OurTrainer(Trainer):
             assert args.lr_scheduler_type == "constant", (
                 "we did not implement lr_schedule."
             )
+        elif args.trainer == "submuon":
+            # SubMuon uses manual updates on core parameters.
+            self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate)
+            assert args.lr_scheduler_type == "constant", (
+                "we did not implement lr_schedule."
+            )
         elif args.trainer == "zo_sgd":
             self.optimizer = SGD(
                 self.model.parameters(), lr=args.learning_rate, momentum=args.momentum
@@ -683,6 +691,8 @@ class OurTrainer(Trainer):
                         tr_loss_step = self.subzero_muon_step(model, inputs)
                     else:
                         raise ValueError(f"q={args.q} is not supported.")
+                elif args.trainer == "submuon":
+                    tr_loss_step = self.submuon_step(model, inputs)
                 elif args.trainer in ["subzero_sgd"]:
                     if args.q == 1:
                         tr_loss_step = self.zo_subspace_step(model, inputs)
@@ -738,6 +748,8 @@ class OurTrainer(Trainer):
                         self.subzero_adamu_update(model)
                     elif args.trainer in ["subzero_muon", "subzo_muon"]:
                         self.subzero_muon_update(model)
+                    elif args.trainer == "submuon":
+                        self.submuon_update(model)
                     elif args.trainer == "subzero_sgd":
                         self.zo_subspace_update(model)
                     elif args.trainer == "forward_grad":
@@ -1122,6 +1134,135 @@ class OurTrainer(Trainer):
                 param.data.mul_(1.0 - lr * wd)
 
             param.data.addcdiv_(m, denom, value=-lr * g)
+
+        self.update_steps += 1
+        if self.update_steps % 1000 == 0:
+            print("model update:", self.update_steps)
+        self.lr_scheduler.step()
+
+    ########################
+    # SubMuon (FO + subspace)
+    ########################
+
+    def submuon_prepare_layers(self, model):
+        if getattr(self, "_submuon_prepared", False):
+            return
+        self._submuon_prepared = True
+        self.submuon_layers = []
+
+        # Freeze all parameters by default
+        for p in model.parameters():
+            p.requires_grad = False
+
+        for name, module in model.named_modules():
+            if isinstance(module, SubMuonLinear):
+                st = self.p_state.setdefault(name, {})
+                st["module"] = module
+                st["M"] = torch.zeros_like(module.X.data)
+                self.submuon_layers.append((name, module))
+                module.X.requires_grad = True
+
+    @torch.no_grad()
+    def _submuon_refresh_basis_and_project(self, module, st, w_shape):
+        args = self.args
+        U_old = module.U
+        V_old = module.V
+        U_new, V_new = fast_svd_method_v2(
+            w_shape=w_shape,
+            device=module.U.device,
+            dtype=module.U.dtype,
+            rank=args.gauss_rank,
+        )
+
+        do_dbg = args.debug_submuon_projection and getattr(self, "_submuon_proj_dbg", 0) < 2
+        if do_dbg:
+            self._submuon_proj_dbg = getattr(self, "_submuon_proj_dbg", 0) + 1
+            X_old = module.X.data.clone()
+            delta_old = U_old @ X_old @ V_old
+
+        R_U = U_new.T @ U_old
+        R_V = V_new @ V_old.T
+        module.X.data = R_U @ module.X.data @ R_V
+        st["M"] = R_U @ st["M"] @ R_V
+
+        module.U.copy_(U_new)
+        module.V.copy_(V_new)
+
+        if do_dbg:
+            delta_new = module.U @ module.X.data @ module.V
+            max_abs = (delta_old - delta_new).abs().max().item()
+            print(f"submuon projection max_abs={max_abs:.3e}")
+
+    def submuon_step(self, model, inputs):
+        """
+        First-order SubMuon step: forward + backward on core X parameters.
+        """
+        self.submuon_prepare_layers(model)
+        args = self.args
+
+        # Refresh subspace bases on schedule
+        if args.update_interval > 0 and self.state.global_step % args.update_interval == 0:
+            for name, module in self.submuon_layers:
+                st = self.p_state[name]
+                w_shape = module.weight.shape
+                self._submuon_refresh_basis_and_project(module, st, w_shape)
+
+        if not hasattr(self, "_submuon_accum_step"):
+            self._submuon_accum_step = 0
+        if self._submuon_accum_step % args.gradient_accumulation_steps == 0:
+            model.zero_grad(set_to_none=True)
+        self._submuon_accum_step += 1
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        if args.n_gpu > 1:
+            loss = loss.mean()
+        loss = loss / args.gradient_accumulation_steps
+        loss.backward()
+        return loss.detach()
+
+    @torch.no_grad()
+    def submuon_update(self, model):
+        """
+        Update SubMuon core parameters X with momentum + Muon whitening.
+        """
+        self.submuon_prepare_layers(model)
+        args = self.args
+        lr = float(self._get_learning_rate())
+        beta = float(args.submuon_beta)
+        lam = float(args.submuon_lambda)
+        ns_steps = int(args.submuon_ns_steps)
+
+        for name, module in self.submuon_layers:
+            st = self.p_state[name]
+            if module.X.grad is None:
+                continue
+            G = module.X.grad
+            M = st["M"]
+            M.mul_(beta).add_(G, alpha=1.0 - beta)
+            st["M"] = M
+
+            M_fp32 = M.float()
+            if torch.count_nonzero(M_fp32) == 0:
+                delta = torch.zeros_like(M_fp32)
+            else:
+                if lam <= 0.0:
+                    delta = zeropower_via_newtonschulz5(M_fp32, steps=ns_steps)
+                else:
+                    r = M_fp32.shape[0]
+                    S = M_fp32.T @ M_fp32 + lam * torch.eye(
+                        r, device=M_fp32.device, dtype=M_fp32.dtype
+                    )
+                    eigvals, eigvecs = torch.linalg.eigh(S)
+                    invsqrt = eigvecs @ torch.diag(
+                        eigvals.clamp(min=1e-12).rsqrt()
+                    ) @ eigvecs.T
+                    delta = M_fp32 @ invsqrt
+
+            module.X.add_(delta.to(module.X.dtype), alpha=-lr)
+            module.X.grad = None
 
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
