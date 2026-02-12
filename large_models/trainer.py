@@ -452,6 +452,12 @@ class OurTrainer(Trainer):
             assert args.lr_scheduler_type == "constant", (
                 "we did not implement lr_schedule."
             )
+        elif args.trainer == "subadam":
+            # SubAdam uses manual updates on core parameters.
+            self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate)
+            assert args.lr_scheduler_type == "constant", (
+                "we did not implement lr_schedule."
+            )
         elif args.trainer == "zo_sgd":
             self.optimizer = SGD(
                 self.model.parameters(), lr=args.learning_rate, momentum=args.momentum
@@ -701,6 +707,8 @@ class OurTrainer(Trainer):
                     tr_loss_step = self.submuon_step(model, inputs)
                 elif args.trainer == "subsgd":
                     tr_loss_step = self.subsgd_step(model, inputs)
+                elif args.trainer == "subadam":
+                    tr_loss_step = self.subadam_step(model, inputs)
                 elif args.trainer in ["subzero_sgd"]:
                     if args.q == 1:
                         tr_loss_step = self.zo_subspace_step(model, inputs)
@@ -760,6 +768,8 @@ class OurTrainer(Trainer):
                         self.submuon_update(model)
                     elif args.trainer == "subsgd":
                         self.subsgd_update(model)
+                    elif args.trainer == "subadam":
+                        self.subadam_update(model)
                     elif args.trainer == "subzero_sgd":
                         self.zo_subspace_update(model)
                     elif args.trainer == "forward_grad":
@@ -1372,6 +1382,140 @@ class OurTrainer(Trainer):
             if module.X.grad is None:
                 continue
             module.X.add_(module.X.grad, alpha=-lr)
+            module.X.grad = None
+
+        self.update_steps += 1
+        if self.update_steps % 1000 == 0:
+            print("model update:", self.update_steps)
+        self.lr_scheduler.step()
+
+    ########################
+    # SubAdam (FO + subspace)
+    ########################
+
+    def subadam_prepare_layers(self, model):
+        if getattr(self, "_subadam_prepared", False):
+            return
+        self._subadam_prepared = True
+        self.subadam_layers = []
+
+        # Freeze all parameters by default
+        for p in model.parameters():
+            p.requires_grad = False
+
+        for name, module in model.named_modules():
+            if isinstance(module, SubMuonLinear):
+                st = self.p_state.setdefault(name, {})
+                st["module"] = module
+                st["adam_m"] = torch.zeros_like(module.X.data)
+                st["adam_v"] = torch.zeros_like(module.X.data)
+                st["adam_t"] = 0
+                self.subadam_layers.append((name, module))
+                module.X.requires_grad = True
+
+    @torch.no_grad()
+    def _subadam_refresh_basis_and_project(self, module, st, w_shape):
+        args = self.args
+        U_old = module.U
+        V_old = module.V
+        U_new, V_new = fast_svd_method_v2(
+            w_shape=w_shape,
+            device=module.U.device,
+            dtype=module.U.dtype,
+            rank=args.gauss_rank,
+        )
+
+        do_dbg = args.debug_submuon_projection and getattr(self, "_subadam_proj_dbg", 0) < 2
+        if do_dbg:
+            self._subadam_proj_dbg = getattr(self, "_subadam_proj_dbg", 0) + 1
+            X_old = module.X.data.clone()
+            delta_old = U_old @ X_old @ V_old
+
+        R_U = U_new.T @ U_old
+        R_V = V_new @ V_old.T
+        module.X.data = R_U @ module.X.data @ R_V
+        st["adam_m"] = R_U @ st["adam_m"] @ R_V
+        st["adam_v"] = R_U @ st["adam_v"] @ R_V
+
+        module.U.copy_(U_new)
+        module.V.copy_(V_new)
+
+        if do_dbg:
+            delta_new = module.U @ module.X.data @ module.V
+            max_abs = (delta_old - delta_new).abs().max().item()
+            print(f"subadam projection max_abs={max_abs:.3e}")
+
+    def subadam_step(self, model, inputs):
+        """
+        First-order SubAdam step: forward + backward on core X parameters.
+        """
+        self.subadam_prepare_layers(model)
+        args = self.args
+
+        # Refresh subspace bases on schedule
+        if args.update_interval > 0 and self.state.global_step % args.update_interval == 0:
+            for name, module in self.subadam_layers:
+                st = self.p_state[name]
+                w_shape = module.weight.shape
+                self._subadam_refresh_basis_and_project(module, st, w_shape)
+
+        if not hasattr(self, "_subadam_accum_step"):
+            self._subadam_accum_step = 0
+        if self._subadam_accum_step % args.gradient_accumulation_steps == 0:
+            model.zero_grad(set_to_none=True)
+        self._subadam_accum_step += 1
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        if args.n_gpu > 1:
+            loss = loss.mean()
+        loss = loss / args.gradient_accumulation_steps
+        loss.backward()
+        return loss.detach()
+
+    @torch.no_grad()
+    def subadam_update(self, model):
+        """
+        Update SubAdam core parameters X with Adam-style updates.
+        """
+        self.subadam_prepare_layers(model)
+        args = self.args
+        lr = float(self._get_learning_rate())
+        beta1 = float(args.subadam_beta1)
+        beta2 = float(args.subadam_beta2)
+        eps = float(args.subadam_eps)
+        wd = float(args.subadam_wd)
+        bias_corr = bool(args.subadam_bias_correction)
+
+        for name, module in self.subadam_layers:
+            st = self.p_state[name]
+            if module.X.grad is None:
+                continue
+            G = module.X.grad
+            m = st["adam_m"]
+            v = st["adam_v"]
+            t = int(st.get("adam_t", 0)) + 1
+
+            m.mul_(beta1).add_(G, alpha=1.0 - beta1)
+            v.mul_(beta2).addcmul_(G, G, value=1.0 - beta2)
+
+            if wd > 0.0:
+                module.X.mul_(1.0 - lr * wd)
+
+            if bias_corr:
+                m_hat = m / (1.0 - beta1 ** t)
+                v_hat = v / (1.0 - beta2 ** t)
+            else:
+                m_hat = m
+                v_hat = v
+
+            module.X.addcdiv_(m_hat, v_hat.sqrt().add_(eps), value=-lr)
+
+            st["adam_m"] = m
+            st["adam_v"] = v
+            st["adam_t"] = t
             module.X.grad = None
 
         self.update_steps += 1

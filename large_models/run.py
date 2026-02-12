@@ -82,6 +82,7 @@ class OurArguments(TrainingArguments):
     ## - subzero_adamu: SubZO-AdaMU training
     ## - submuon: first-order Subspace Muon
     ## - subsgd: subspace SGD (FO) on core X
+    ## - subadam: subspace Adam (FO) on core X
     ## - zo_sign_opt: zeroth-order sign sgd training
     ## - forward_grad: forward gradient
     ## (add) -zo_sgd_svd 
@@ -117,6 +118,13 @@ class OurArguments(TrainingArguments):
     submuon_lambda: float = 0.0
     submuon_ns_steps: int = 5
     debug_submuon_projection: bool = False
+
+    # SubAdam
+    subadam_beta1: float = 0.9
+    subadam_beta2: float = 0.999
+    subadam_eps: float = 1e-8
+    subadam_wd: float = 0.0
+    subadam_bias_correction: bool = True
 
     
     # Prefix tuning
@@ -309,7 +317,7 @@ class Framework:
                 sum(p.numel() for p in model.parameters() if p.requires_grad),
             ))
 
-        if self.args.trainer in ["submuon", "subsgd"]:
+        if self.args.trainer in ["submuon", "subsgd", "subadam"]:
             from submuon import inject_submuon_linear
             inject_submuon_linear(model, rank=self.args.gauss_rank)
 
