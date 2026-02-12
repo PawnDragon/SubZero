@@ -112,6 +112,7 @@ class SST2Dataset(Dataset):
     train_sep = "\n\n"
 
     def __init__(self, subtask=None, **kwargs) -> None:
+        super().__init__(subtask, **kwargs)
         self.load_dataset(subtask, **kwargs)
 
     def load_dataset(self, path, **kwargs):
